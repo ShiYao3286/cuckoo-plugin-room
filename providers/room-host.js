@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -497,13 +497,46 @@ function chatSnapshot() {
   };
 }
 
-/** 把最近的聊天记录整理成给 AI 看的上下文 */
+/** 把最近 N 条聊天记录整理成给 AI 看的上下文 */
 function buildChatContext(limit) {
   const n = Math.max(0, Number(limit) || 14);
   const recent = chat.messages.filter((m) => m.role === 'user' || m.role === 'ai').slice(-n);
   if (!recent.length) return '';
   const lines = recent.map((m) => (m.role === 'user' ? ('我：' + m.text) : ((m.who || 'AI') + '：' + m.text)));
   return lines.join('\n');
+}
+
+/**
+ * 把"引用"整理成提示词前缀。
+ *
+ * 为什么需要它：@ 只能指定"发给谁"，没法指定"针对哪条"。
+ * 想说"针对刚才那条"时，用户只能手动复述一遍，既啰嗦又容易失真。
+ *
+ * 两条路径都要有：优先用 id 在本地记录里查到原文（最准），
+ * 查不到就退回页面传来的快照（记录被清空/截断时仍能用）。
+ * 截断上限 600 字 —— 引用整段长回复会把提示词撑爆，得不偿失。
+ */
+const QUOTE_MAX = 600;
+
+function buildQuoteBlock(quote) {
+  if (!quote || typeof quote !== 'object') return '';
+  let who = typeof quote.who === 'string' ? quote.who.trim() : '';
+  let text = '';
+
+  // 1) 按 id 查本地记录
+  if (quote.id) {
+    const found = chat.messages.find((m) => m.id === quote.id);
+    if (found) {
+      who = found.who || who;
+      text = found.text || '';
+    }
+  }
+  // 2) 退回页面快照
+  if (!text && typeof quote.text === 'string') text = quote.text;
+  if (!text) return '';
+
+  const trimmed = text.length > QUOTE_MAX ? (text.slice(0, QUOTE_MAX) + '…（已截断）') : text;
+  return '【引用】' + (who || '上文') + ' 说：\n' + trimmed + '\n（以上是被引用的原文，请针对它作答）\n\n';
 }
 
 /**
@@ -531,21 +564,32 @@ async function chatSend(body) {
 
   const mode = body.mode === 'sequential' ? 'sequential' : 'parallel';
   const withContext = body.withContext !== false;
+  const quoteBlock = buildQuoteBlock(body.quote);
+
+  // 顺序很重要：必须在 pushMsg 之前取上下文。
+  // 否则当前这条消息已经被算进"最近 14 条"里，于是它在提示词里出现两次
+  // ——一次作为历史，一次作为正式发言。既浪费 token，又可能让 AI 以为用户说了两遍。
+  const baseContext = withContext ? buildChatContext(14) : '';
 
   const userMsg = pushMsg({
     role: 'user', who: '我', text: text,
     targets: targets.map((t) => ({ windowId: t.windowId, label: t.title || t.providerId })),
     mode: mode,
+    // 记下引用的是哪条，界面据此显示"回复某某"
+    quote: body.quote && body.quote.id
+      ? { id: body.quote.id, who: body.quote.who || '', text: (body.quote.text || '').slice(0, 200) }
+      : null,
   });
 
   chat.sending = true;
-  const baseContext = withContext ? buildChatContext(14) : '';
+  // 提示词组装顺序：历史上下文 → 引用原文 → 本次发言
+  const prefix = (baseContext ? (baseContext + '\n\n---\n') : '') + quoteBlock;
 
   const one = async (w) => {
     chat.busy[w.windowId] = true;
     streamStart(w.windowId, w.title || w.providerId);
     try {
-      const prompt = baseContext ? (baseContext + '\n\n---\n' + text) : text;
+      const prompt = prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
       });
@@ -579,8 +623,10 @@ async function chatSend(body) {
           chat.busy[w.windowId] = true;
           streamStart(w.windowId, w.title || w.providerId);
           try {
+            // 顺序模式下每轮重新取上下文（后一位要看到前一位刚说的），
+            // 但引用块是固定的，直接复用
             const ctxNow = withContext ? buildChatContext(14) : '';
-            const prompt = ctxNow ? (ctxNow + '\n\n---\n' + text) : text;
+            const prompt = (ctxNow ? (ctxNow + '\n\n---\n') : '') + quoteBlock + text;
             const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
               onProgress: (tx) => streamDelta(w.windowId, tx),
             });

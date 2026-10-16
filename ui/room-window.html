@@ -204,6 +204,36 @@
   .bub .att .f{display:inline-flex;align-items:center;gap:6px;background:var(--card-2);
     border:1px solid var(--line);border-radius:7px;padding:5px 10px;font-size:12px}
 
+  /* ---------- 引用条 ---------- */
+  #quoteBar{display:none;align-items:flex-start;gap:8px;margin-bottom:7px;padding:7px 10px;
+    background:var(--card);border:1px solid var(--line-2);border-left:3px solid var(--pri);
+    border-radius:7px;font-size:12px}
+  #quoteBar.show{display:flex}
+  #quoteBar .qcol{flex:1;min-width:0}
+  #quoteBar .qw{color:var(--pri);font-weight:600;font-size:11.5px;margin-bottom:2px}
+  #quoteBar .qt{color:var(--fg-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #quoteBar .qx{cursor:pointer;color:var(--fg-3);flex:none;font-size:14px;line-height:1;padding:0 2px}
+  #quoteBar .qx:hover{color:var(--err)}
+
+  /* 消息上的操作按钮（默认隐藏，悬停出现） */
+  .ev .acts{display:flex;gap:4px;align-self:flex-start;margin-top:6px;opacity:0;transition:opacity .13s}
+  .ev:hover .acts{opacity:1}
+  .ev.me .acts{order:-1}
+  .ev .acts button{padding:2px 7px;font-size:11px;border-radius:6px;background:var(--card);
+    border:1px solid var(--line-2);color:var(--fg-2)}
+  .ev .acts button:hover{background:var(--hover);color:var(--fg)}
+
+  /* 消息内的引用（"回复某某"） */
+  .ev .bub .qref{display:block;margin:-2px 0 7px;padding:5px 9px;border-left:2px solid var(--line-2);
+    background:var(--code-bg);border-radius:0 6px 6px 0;font-size:11.5px;color:var(--fg-2);
+    cursor:pointer;transition:border-color .13s}
+  .ev .bub .qref:hover{border-left-color:var(--pri)}
+  .ev .bub .qref .qw{color:var(--pri);font-weight:600;margin-right:5px}
+  .ev .bub .qref .qt{white-space:pre-wrap;word-break:break-word;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  /* 被跳转高亮 */
+  .ev.flash .bub{box-shadow:0 0 0 2px var(--pri)}
+
   /* ---------- 等待指示 ---------- */
   .typing{display:inline-flex;gap:4px;align-items:center;color:var(--fg-2);font-size:12px}
   .typing b{width:5px;height:5px;border-radius:50%;background:currentColor;animation:tp 1.3s infinite}
@@ -327,6 +357,13 @@
   <div id="composer">
     <div id="mention"></div>
     <div id="sendTo"></div>
+    <div id="quoteBar">
+      <div class="qcol">
+        <div class="qw" id="quoteWho"></div>
+        <div class="qt" id="quoteText"></div>
+      </div>
+      <span class="qx" id="quoteX" title="取消引用">✕</span>
+    </div>
     <div class="box">
       <button id="btn-attach" class="icon" title="添加图片或文件">📎</button>
       <textarea id="input" rows="1" placeholder="输入消息…  用 @ 指定对话对象，Enter 发送"></textarea>
@@ -361,6 +398,7 @@
   var bannerEl = $('banner'), bannerTxt = $('banner-txt'), bannerX = $('banner-x');
   var lightbox = $('lightbox'), lightboxImg = $('lightbox-img');
   var sseEl = $('sse'), sseTxt = $('sse-txt');
+  var quoteBar = $('quoteBar'), quoteWho = $('quoteWho'), quoteText = $('quoteText'), quoteX = $('quoteX');
 
   function setError(msg) {
     state.error = msg || '';
@@ -395,6 +433,8 @@
     // 流式：windowId → { text, label }，由 SSE 推送维护
     streams: {},
     sse: 'off',
+    // 当前引用：{ id, who, text } 或 null
+    quote: null,
   };
 
   // ===================== 通信 =====================
@@ -721,11 +761,13 @@
   function buildMsg(m) {
     if (m.role === 'system') {
       var s = el('div', 'ev sys' + (m.err ? ' err' : ''));
+      s.setAttribute('data-mid', m.id);
       s.appendChild(el('div', 'bub', m.text));
       return s;
     }
     var me = m.role === 'user';
     var d = el('div', 'ev ' + (me ? 'me' : 'ai'));
+    d.setAttribute('data-mid', m.id);
     d.style.setProperty('--id-h', me ? 212 : hueOf(m.windowId));
 
     d.appendChild(el('div', 'av', me ? '我' : initialOf(m.who)));
@@ -737,6 +779,19 @@
     col.appendChild(hd);
 
     var bub = el('div', 'bub');
+
+    // 被引用原文：显示在气泡最上方，点了能跳回那条消息
+    if (m.quote && m.quote.text) {
+      var qr = el('div', 'qref');
+      qr.appendChild(el('span', 'qw', m.quote.who || '上文'));
+      qr.appendChild(el('span', 'qt', m.quote.text));
+      qr.title = '点击跳到被引用的消息';
+      (function (qid) {
+        qr.addEventListener('click', function (e) { e.stopPropagation(); jumpTo(qid); });
+      })(m.quote.id);
+      bub.appendChild(qr);
+    }
+
     if (me) bub.appendChild(el('span', null, m.text || ''));
     else bub.appendChild(renderMarkdown(m.text));
     bub.style.whiteSpace = me ? 'pre-wrap' : 'normal';
@@ -765,8 +820,57 @@
         + (m.mode === 'sequential' ? '（顺序）' : '')));
       col.appendChild(to);
     }
+
+    // 悬停时出现的操作：引用 / 复制
+    var acts = el('div', 'acts');
+    var btnQ = el('button', null, '引用');
+    btnQ.title = '引用这条消息（配合 @ 可精确指代）';
+    btnQ.addEventListener('click', function (e) { e.stopPropagation(); setQuote(m); });
+    acts.appendChild(btnQ);
+
+    var btnC = el('button', null, '复制');
+    btnC.title = '复制原文';
+    btnC.addEventListener('click', function (e) {
+      e.stopPropagation();
+      copyText(m.text || '', btnC);
+    });
+    acts.appendChild(btnC);
+
+    // acts 放在 col 之外：气泡宽度受限，按钮跟着气泡走会显得挤
     d.appendChild(col);
+    d.appendChild(acts);
     return d;
+  }
+
+  /** 复制到剪贴板；失败时如实反馈（沙箱窗口可能没有 clipboard 权限） */
+  function copyText(text, btn) {
+    var done = function (ok) {
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = ok ? '已复制' : '复制失败';
+      setTimeout(function () { btn.textContent = old; }, 1200);
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(fallbackCopy(text)); });
+        return;
+      }
+    } catch (e) { /* 落到下面的兜底 */ }
+    done(fallbackCopy(text));
+  }
+
+  function fallbackCopy(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (e) { return false; }
   }
 
   function openLightbox(src) {
@@ -1065,6 +1169,61 @@
     return d;
   }
 
+  // ===================== 引用 =====================
+  /**
+   * 引用一条消息。配合 @ 使用：@ 决定"发给谁"，引用决定"针对哪条"。
+   *
+   * 只记 id + 快照；原文由后端按 id 从记录里查（最准），
+   * 查不到才退回快照（记录被清空/截断时仍能用）。
+   */
+  function setQuote(m) {
+    if (!m) { clearQuote(); return; }
+    var snap = String(m.text || '');
+    state.quote = {
+      id: m.id,
+      who: m.who || (m.role === 'user' ? '我' : 'AI'),
+      text: snap.length > 200 ? (snap.slice(0, 200) + '…') : snap,
+    };
+    renderQuoteBar();
+    try { inputEl.focus(); } catch (e) {}
+  }
+
+  function clearQuote() {
+    state.quote = null;
+    renderQuoteBar();
+  }
+
+  function renderQuoteBar() {
+    var q = state.quote;
+    if (!q) { quoteBar.className = ''; quoteWho.textContent = ''; quoteText.textContent = ''; return; }
+    quoteBar.className = 'show';
+    quoteWho.textContent = '回复 ' + q.who;
+    quoteText.textContent = q.text;
+  }
+
+  quoteX.addEventListener('click', clearQuote);
+
+  /** 滚到某条消息并闪一下（点引用块时用） */
+  function jumpTo(id) {
+    var node = findById(id);
+    if (!node) return;
+    try { node.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {
+      try { msgsEl.scrollTop = node.offsetTop - 80; } catch (e2) {}
+    }
+    node.className += ' flash';
+    setTimeout(function () {
+      node.className = node.className.replace(/\s*flash/, '');
+    }, 1200);
+  }
+
+  function findById(id) {
+    var kids = Array.prototype.slice.call(msgsEl.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].getAttribute && kids[i].getAttribute('data-mid') === String(id)) return kids[i];
+    }
+    return null;
+  }
+
   // ===================== 状态 =====================
   function renderStatus() {
     var busy = (state.chat.busy || []).length;
@@ -1140,6 +1299,8 @@
       text: text,
       targets: t.map(function (w) { return w.windowId; }),
       mode: 'parallel',
+      // 引用的原文由后端按 id 从记录里查；这里只传 id 与快照兜底
+      quote: state.quote ? { id: state.quote.id, who: state.quote.who, text: state.quote.text } : null,
       files: state.attachments.map(function (a) {
         return { name: a.name, mime: a.mime, data: a.data };
       })
@@ -1160,6 +1321,7 @@
       inputEl.value = '';
       inputEl.style.height = 'auto';
       state.attachments = [];
+      clearQuote();          // 发送成功才清引用；失败时保留，方便直接重试
       renderAtts();
       return refresh();
     }, function (e) {
@@ -1187,6 +1349,8 @@
       if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); chooseMention(state.mention.idx); return; }
       if (e.key === 'Escape') { e.preventDefault(); closeMention(); return; }
     }
+    // Esc 取消引用（有引用时才拦，免得影响其它场景）
+    if (e.key === 'Escape' && state.quote) { e.preventDefault(); clearQuote(); return; }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
