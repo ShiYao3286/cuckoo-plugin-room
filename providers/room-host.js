@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.6.1';
+const VERSION = '0.7.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -247,19 +247,35 @@ function buildCaptureCode(timeoutMs) {
     '  return new Promise(function (resolve) {',
     '    var acc = "", lastText = "", done = false;',
     '    var BT = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);',
+    // 把增量文本挂到页面全局，供主进程轮询取出 —— executeJavaScript 只在最后 resolve 一次，
+    // 没有这个出口就拿不到中间过程。带一个单调递增的 n，便于主进程判断有没有变化。
+    '    window.__ckRoomStream = { t: "", n: 0, done: false };',
     '    function hasToolBlock(t) { t = t || ""; return t.indexOf(BT + "cuckoo") >= 0 || t.indexOf(BT + "js") >= 0; }',
     '    function finish(text, reason) {',
     '      if (done) return; done = true;',
     '      window.removeEventListener("cuckoo-ai-stream", onStream);',
     '      window.removeEventListener("cuckoo-ai-response", onResp);',
+    '      try { window.__ckRoomStream = { t: String(text || ""), n: window.__ckRoomStream.n + 1, done: true, reason: reason }; } catch (e) {}',
     '      resolve({ text: text, reason: reason });',
     '    }',
-    '    function onStream(ev) { var d = (ev && ev.detail) || {}; if (typeof d.text === "string" && d.text.length >= acc.length) acc = d.text; }',
+    '    function onStream(ev) {',
+    '      var d = (ev && ev.detail) || {};',
+    '      if (typeof d.text === "string" && d.text.length >= acc.length) {',
+    '        acc = d.text;',
+    // thinking 阶段也可能推流：只有拿到正文才更新，避免把思考过程当正文显示
+    '        try { window.__ckRoomStream = { t: acc, n: window.__ckRoomStream.n + 1, done: false }; } catch (e) {}',
+    '      }',
+    '    }',
     '    function onResp(ev) {',
     '      var d = (ev && ev.detail) || {};',
     '      if (!d.finished) return;',
     '      var t = d.text || acc || ""; lastText = t;',
-    '      if (hasToolBlock(t)) { acc = ""; return; }',
+    '      if (hasToolBlock(t)) {',
+    // 工具调用轮：清空重来，并让页面上的半成品也一并清掉
+    '        acc = "";',
+    '        try { window.__ckRoomStream = { t: "", n: window.__ckRoomStream.n + 1, done: false, tool: true }; } catch (e) {}',
+    '        return;',
+    '      }',
     '      finish(t, "finished");',
     '    }',
     '    window.addEventListener("cuckoo-ai-stream", onStream);',
@@ -271,24 +287,58 @@ function buildCaptureCode(timeoutMs) {
   ].join('\n');
 }
 
-/** 向指定窗口发一条消息并等回复 */
-async function sendAndCapture(wc, text, timeoutMs) {
+/** 只读页面上那个增量出口；不在则返回 null */
+const STREAM_PEEK = '(function(){ var s = window.__ckRoomStream; return s ? { t: s.t, n: s.n, done: s.done === true } : null; })();';
+
+/**
+ * 向指定窗口发一条消息并等回复。
+ *
+ * @param opts.onProgress 可选：收到增量文本时调用（text, meta）。
+ *        实现方式是从主进程轮询页面全局的增量出口 —— executeJavaScript 中途不返回，
+ *        没有回调通道，轮询是这里最直接可靠的做法（250ms 一次，脚本极小）。
+ */
+async function sendAndCapture(wc, text, timeoutMs, opts) {
   const to = Math.max(15000, Math.min(900000, Number(timeoutMs) || 180000));
+  const onProgress = opts && typeof opts.onProgress === 'function' ? opts.onProgress : null;
+
   // 先装监听，再发送（同一 webContents 上两次 executeJavaScript 的顺序有保证）
   const capPromise = wc.executeJavaScript(buildCaptureCode(to), true)
     .catch((e) => ({ text: '', reason: 'capture_error:' + (e && e.message) }));
 
+  // 增量轮询：只在有 onProgress 时启动，且随 capture 结束自动停
+  let stopPeek = false;
+  let peekTimer = null;
+  if (onProgress) {
+    let lastN = -1;
+    (async function peekLoop() {
+      while (!stopPeek) {
+        await new Promise((r) => { peekTimer = setTimeout(r, 250); });
+        if (stopPeek) break;
+        try {
+          const s = await wc.executeJavaScript(STREAM_PEEK, true);
+          if (!s || typeof s.n !== 'number') continue;
+          if (s.n === lastN) continue;
+          lastN = s.n;
+          if (typeof s.t === 'string' && s.t.length) onProgress(s.t, { done: s.done === true });
+        } catch (_) { /* 页面可能正在导航，忽略这一轮 */ }
+      }
+    })().catch(() => {});
+  }
+  const stopPeekLoop = () => { stopPeek = true; if (peekTimer) clearTimeout(peekTimer); };
+
   let sendRes;
   try { sendRes = await wc.executeJavaScript(buildSendCode(text), true); }
-  catch (e) { return { ok: false, error: '注入失败: ' + (e && e.message) }; }
-  if (sendRes === 'NO_INPUT') return { ok: false, error: '未找到输入框（页面可能未就绪）' };
-  if (sendRes === 'SET_FAILED') return { ok: false, error: '写入输入框失败' };
-  if (sendRes !== 'SENT') return { ok: false, error: '发送失败: ' + sendRes };
+  catch (e) { stopPeekLoop(); return { ok: false, error: '注入失败: ' + (e && e.message) }; }
+  if (sendRes === 'NO_INPUT') { stopPeekLoop(); return { ok: false, error: '未找到输入框（页面可能未就绪）' }; }
+  if (sendRes === 'SET_FAILED') { stopPeekLoop(); return { ok: false, error: '写入输入框失败' }; }
+  if (sendRes !== 'SENT') { stopPeekLoop(); return { ok: false, error: '发送失败: ' + sendRes }; }
 
   const res = await Promise.race([
     capPromise,
     new Promise((r) => setTimeout(() => r({ text: '', reason: 'overall_timeout' }), to + 5000)),
   ]);
+  stopPeekLoop();
+
   const reason = res && res.reason;
   if (reason === 'timeout' || reason === 'overall_timeout') {
     return { ok: false, error: '等待回复超时', partial: (res && res.text) || '' };
@@ -493,14 +543,22 @@ async function chatSend(body) {
 
   const one = async (w) => {
     chat.busy[w.windowId] = true;
+    streamStart(w.windowId, w.title || w.providerId);
     try {
       const prompt = baseContext ? (baseContext + '\n\n---\n' + text) : text;
-      const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs);
+      const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
+        onProgress: (t) => streamDelta(w.windowId, t),
+      });
       if (res.ok) {
+        streamEnd(w.windowId, res.text);
         return pushMsg({ role: 'ai', who: w.title || w.providerId || ('窗口 ' + w.windowId), windowId: w.windowId, text: res.text, replyTo: userMsg.id });
       }
+      streamEnd(w.windowId, '', res.error);
       pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」未回复：' + res.error, err: true, replyTo: userMsg.id });
       return null;
+    } catch (e) {
+      streamEnd(w.windowId, '', (e && e.message) || String(e));
+      throw e;
     } finally {
       chat.busy[w.windowId] = false;
     }
@@ -519,12 +577,23 @@ async function chatSend(body) {
           const t = pickTarget({ windowId: w.windowId });
           if (!t.ok) { pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」不可用：' + t.error, err: true }); continue; }
           chat.busy[w.windowId] = true;
+          streamStart(w.windowId, w.title || w.providerId);
           try {
             const ctxNow = withContext ? buildChatContext(14) : '';
             const prompt = ctxNow ? (ctxNow + '\n\n---\n' + text) : text;
-            const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs);
-            if (res.ok) pushMsg({ role: 'ai', who: w.title || w.providerId, windowId: w.windowId, text: res.text, replyTo: userMsg.id });
-            else pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」未回复：' + res.error, err: true });
+            const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
+              onProgress: (tx) => streamDelta(w.windowId, tx),
+            });
+            if (res.ok) {
+              streamEnd(w.windowId, res.text);
+              pushMsg({ role: 'ai', who: w.title || w.providerId, windowId: w.windowId, text: res.text, replyTo: userMsg.id });
+            } else {
+              streamEnd(w.windowId, '', res.error);
+              pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」未回复：' + res.error, err: true });
+            }
+          } catch (e) {
+            streamEnd(w.windowId, '', (e && e.message) || String(e));
+            throw e;
           } finally {
             chat.busy[w.windowId] = false;
           }
@@ -544,6 +613,97 @@ async function chatSend(body) {
 }
 
 loadChat();
+
+// ===================== SSE 事件推送 =====================
+/**
+ * 流式输出为什么要用 SSE 而不是继续轮询 /chat/status：
+ * 页面现在 1.5 秒轮询一次，做流式会一顿一顿的。SSE 是单向服务端推送，
+ * 浏览器原生支持（EventSource），比 WebSocket 简单得多 —— 本服务的路由是手写
+ * http server，接 WebSocket 要自己实现握手与帧解析，不划算。
+ *
+ * 注意：EventSource 不支持自定义请求头，令牌只能走 query（页面从服务端拿到，
+ * 不经过第三方）。同时校验 Origin，非本机来源直接拒。
+ */
+const sseClients = new Set();
+let sseSeq = 0;
+
+function sseWrite(res, event, data) {
+  try {
+    res.write('event: ' + event + '\n');
+    res.write('data: ' + JSON.stringify(data) + '\n\n');
+  } catch (_) { /* 连接可能已断，下面统一清理 */ }
+}
+
+/** 广播给所有 SSE 订阅者 */
+function sseBroadcast(event, data) {
+  if (!sseClients.size) return;
+  for (const c of Array.from(sseClients)) {
+    sseWrite(c.res, event, data);
+    if (c.res.writableEnded) sseClients.delete(c);
+  }
+}
+
+function sseHandle(req, res, url) {
+  const t = url.searchParams.get('t') || '';
+  if (t !== token()) { json(res, 403, { ok: false, error: 'unauthorized' }); return; }
+  // EventSource 不带自定义头，所以这里只能靠 Origin 兜一层
+  const origin = req.headers.origin;
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) {
+    json(res, 403, { ok: false, error: 'origin not allowed' });
+    return;
+  }
+
+  res.writeHead(200, Object.assign({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  }, CORS_HEADERS));
+  // 告诉客户端重连间隔
+  try { res.write('retry: 2000\n\n'); } catch (_) {}
+
+  const client = { id: ++sseSeq, res: res };
+  sseClients.add(client);
+  log('SSE 客户端接入 #' + client.id + '（当前 ' + sseClients.size + ' 个）');
+
+  // 立刻推一次当前状态，避免刚连上时界面空白
+  sseWrite(res, 'hello', { clientId: client.id, streaming: Object.keys(activeStreams).length > 0 });
+
+  // 心跳：防中间层掐断空闲连接（本机直连其实不会，但代价极低）
+  const hb = setInterval(() => {
+    try { res.write(': hb\n\n'); } catch (_) {}
+    if (res.writableEnded) { clearInterval(hb); sseClients.delete(client); }
+  }, 15000);
+
+  const cleanup = () => {
+    clearInterval(hb);
+    sseClients.delete(client);
+    log('SSE 客户端断开 #' + client.id + '（剩余 ' + sseClients.size + ' 个）');
+  };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+  res.on('close', cleanup);
+}
+
+/** 正在流式输出的目标：windowId → { text, startedAt, label } */
+const activeStreams = {};
+
+function streamStart(windowId, label) {
+  activeStreams[windowId] = { text: '', startedAt: Date.now(), label: label || '' };
+  sseBroadcast('stream-start', { windowId: windowId, label: activeStreams[windowId].label });
+}
+function streamDelta(windowId, text) {
+  const s = activeStreams[windowId];
+  if (!s) return;
+  s.text = text;
+  sseBroadcast('stream-delta', { windowId: windowId, text: text, len: text.length });
+}
+function streamEnd(windowId, finalText, error) {
+  const s = activeStreams[windowId];
+  const dur = s ? (Date.now() - s.startedAt) : 0;
+  delete activeStreams[windowId];
+  sseBroadcast('stream-end', { windowId: windowId, text: finalText || '', error: error || null, ms: dur });
+}
 
 // ===================== 配置与令牌 =====================
 function readConfig() {
@@ -977,8 +1137,19 @@ function handle(req, res) {
     return;
   }
 
+  // ===== 流式事件（SSE）=====
+  if (p === '/chat/events') { sseHandle(req, res, url); return; }
+
   // ===== 聊天室 =====
-  if (p === '/chat/status') { json(res, 200, { ok: true, chat: chatSnapshot() }); return; }
+  if (p === '/chat/status') {
+    // 带上"正在流式输出的目标"，页面重连后能立即恢复打字机视图
+    const streams = {};
+    for (const k of Object.keys(activeStreams)) {
+      streams[k] = { text: activeStreams[k].text, label: activeStreams[k].label };
+    }
+    json(res, 200, { ok: true, chat: chatSnapshot(), streams: streams });
+    return;
+  }
 
   if (p === '/chat/clear' && req.method === 'POST') {
     chat.messages = [];

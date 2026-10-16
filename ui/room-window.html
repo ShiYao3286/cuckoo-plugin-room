@@ -211,6 +211,27 @@
   .typing b:nth-child(3){animation-delay:.36s}
   @keyframes tp{0%,60%,100%{opacity:.22}30%{opacity:1}}
 
+  /* ---------- 流式输出 ---------- */
+  /* 正在生成的气泡：左边一条流动的光带，末尾一个光标 */
+  .ev.streaming .bub{position:relative;overflow:hidden}
+  .ev.streaming .bub::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;
+    background:linear-gradient(180deg,transparent,var(--pri),transparent);
+    animation:flow 1.4s linear infinite}
+  @keyframes flow{0%{transform:translateY(-100%)}100%{transform:translateY(100%)}}
+  .cursor{display:inline-block;width:2px;height:1.05em;vertical-align:-.16em;margin-left:2px;
+    background:var(--pri);animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .stream-dots{display:inline-flex;gap:3px;align-items:center;margin-left:7px;vertical-align:middle}
+  .stream-dots i{width:4px;height:4px;border-radius:50%;background:var(--pri);animation:tp 1.1s infinite}
+  .stream-dots i:nth-child(2){animation-delay:.15s}
+  .stream-dots i:nth-child(3){animation-delay:.3s}
+  /* SSE 连接状态：断了会退回轮询，给用户一个可见交代 */
+  #sse{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--fg-3);flex:none;
+    cursor:default;user-select:none}
+  #sse i{width:5px;height:5px;border-radius:50%;background:var(--fg-3);flex:none}
+  #sse.on i{background:var(--ok)}
+  #sse.off i{background:var(--warn)}
+
   /* ---------- 附件预览区 ---------- */
   #atts{display:flex;gap:8px;flex-wrap:wrap;padding:0 14px;background:var(--chrome);flex:none}
   #atts:not(:empty){padding:10px 14px;border-top:1px solid var(--line)}
@@ -285,6 +306,7 @@
     <i id="dot"></i>
     <h1>多 AI 同室</h1>
     <span class="sp"></span>
+    <div id="sse" class="off" title="流式输出连接状态"><i></i><span id="sse-txt">连接中</span></div>
     <div id="status">正在连接…</div>
     <button id="btn-refresh" class="icon" title="刷新">↻</button>
     <button id="btn-clear" class="icon" title="清空聊天记录">🗑</button>
@@ -338,6 +360,7 @@
   var btnClear = $('btn-clear'), filePick = $('filePick'), dropEl = $('drop'), footEl = $('foot');
   var bannerEl = $('banner'), bannerTxt = $('banner-txt'), bannerX = $('banner-x');
   var lightbox = $('lightbox'), lightboxImg = $('lightbox-img');
+  var sseEl = $('sse'), sseTxt = $('sse-txt');
 
   function setError(msg) {
     state.error = msg || '';
@@ -369,6 +392,9 @@
     seen: {},
     lastCount: 0,
     theme: 'dark',
+    // 流式：windowId → { text, label }，由 SSE 推送维护
+    streams: {},
+    sse: 'off',
   };
 
   // ===================== 通信 =====================
@@ -593,7 +619,8 @@
     state.lastCount = ms.length;
 
     var busy = (state.chat.busy || []).length;
-    var working = !!(state.chat.sending || busy);
+    var streaming = Object.keys(state.streams).length > 0;
+    var working = !!(state.chat.sending || busy || streaming);
 
     if (!ms.length && !working) {
       if (!msgsEl.querySelector('.empty')) {
@@ -629,7 +656,8 @@
 
     var old = msgsEl.querySelector('.running');
     if (old) old.remove();
-    if (working) {
+    // 有流式气泡时不显示"等待"占位——那会让同一个人出现两个气泡
+    if (working && !Object.keys(state.streams).length) {
       var r = el('div', 'ev sys running');
       var b = el('div', 'bub');
       var tp = el('span', 'typing');
@@ -640,6 +668,9 @@
       msgsEl.appendChild(r);
     }
     if (stick) msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    // 流式节点可能在整树重绘时被清掉，这里补回来
+    if (Object.keys(state.streams).length) renderStreams();
 
     // marked 没加载上 → 在界面上说清楚，而不是让用户对着字面星号猜
     if (markdownBroken && !markdownWarned) {
@@ -845,6 +876,158 @@
     renderPeers(); renderSendTo();
   }
 
+  // ===================== 流式输出（SSE） =====================
+  /**
+   * 用 EventSource 接服务端推送的增量文本。
+   *
+   * 为什么不用 fetch 流式读：EventSource 自带重连与事件分发，代码量小得多；
+   * 代价是不能带自定义请求头，所以令牌走 query（页面从服务端拿到，不经第三方）。
+   *
+   * 连不上怎么办：不报错、不打断使用 —— 退回原来的 1.5 秒轮询（回复照样会到，
+   * 只是没有打字机效果），并在顶栏用小圆点如实标出状态。
+   */
+  var es = null;
+  var esRetry = null;
+
+  function setSse(status, text) {
+    state.sse = status;
+    sseEl.className = status;
+    sseTxt.textContent = text || (status === 'on' ? '实时' : status === 'off' ? '轮询' : '连接中');
+    sseEl.title = status === 'on'
+      ? '正在接收实时增量（打字机效果）'
+      : '未连接实时通道，已退回轮询模式（回复仍会正常送达）';
+  }
+
+  function connectSse() {
+    if (es) { try { es.close(); } catch (e) {} es = null; }
+    if (typeof EventSource !== 'function') { setSse('off', '轮询'); return; }
+    try {
+      es = new EventSource('http://127.0.0.1:' + PORT + '/chat/events?t=' + encodeURIComponent(TOKEN));
+    } catch (e) { setSse('off', '轮询'); return; }
+
+    es.addEventListener('open', function () { setSse('on'); });
+
+    es.addEventListener('hello', function () {
+      setSse('on');
+      // 服务端可能已经在推流（比如页面刚刷新），拉一次快照补上
+      api('/chat/status').then(function (r) {
+        if (r && r.streams) { state.streams = r.streams; renderMsgs(); }
+      }, function () {});
+    });
+
+    es.addEventListener('stream-start', function (e) {
+      var d = parseEv(e);
+      if (!d) return;
+      state.streams[d.windowId] = { text: '', label: d.label || '' };
+      renderMsgs();
+    });
+
+    es.addEventListener('stream-delta', function (e) {
+      var d = parseEv(e);
+      if (!d) return;
+      var s = state.streams[d.windowId];
+      if (!s) { state.streams[d.windowId] = { text: d.text || '', label: '' }; }
+      else { s.text = d.text || ''; }
+      renderStreams();
+    });
+
+    es.addEventListener('stream-end', function (e) {
+      var d = parseEv(e);
+      if (!d) return;
+      delete state.streams[d.windowId];
+      // 关键：删除后必须重新跑一次 renderStreams 才会把气泡摘掉。
+      // 只调 renderMsgs() 不行 —— 它只在"还有流"时才回头调 renderStreams。
+      renderStreams();
+      // 最终内容以 /chat/status 里落库的消息为准
+      pullChat().then(function () { renderMsgs(); }, function () { renderMsgs(); });
+    });
+
+    es.addEventListener('error', function () {
+      // EventSource 会自己重连；这里只更新指示，不弹错误横幅（不该打断使用）
+      setSse('off', '轮询');
+    });
+  }
+
+  function parseEv(e) {
+    try { return JSON.parse(e.data); } catch (_) { return null; }
+  }
+
+  /** 只更新正在流式的气泡内容，不重建整棵 DOM（否则光标闪烁、滚动会跳） */
+  function renderStreams() {
+    var stick = msgsEl.scrollTop + msgsEl.clientHeight >= msgsEl.scrollHeight - 90;
+    var ids = Object.keys(state.streams);
+
+    // 先摘掉已经没有对应流的节点。
+    // 直接遍历 children 而不用 querySelectorAll：少一层选择器依赖，行为更可预期。
+    var kids = Array.prototype.slice.call(msgsEl.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      var n = kids[i];
+      if (!n.getAttribute || n.className.indexOf('streaming') < 0) continue;
+      if (ids.indexOf(String(n.getAttribute('data-wid'))) < 0) n.remove();
+    }
+
+    for (var k = 0; k < ids.length; k++) {
+      var wid = ids[k];
+      var st = state.streams[wid];
+      var node = findByWid(wid);
+      if (!node) {
+        node = buildStreamingNode(wid, st);
+        msgsEl.appendChild(node);
+        // 流式气泡出现时，把"等待"占位收起来，避免同一个人出现两个气泡
+        var r = msgsEl.querySelector('.running');
+        if (r) r.remove();
+      }
+      var body = queryIn(node, 'stream-body');
+      if (body) {
+        body.textContent = st.text || '';
+        var dots = queryIn(node, 'stream-dots');
+        if (dots) dots.style.display = st.text ? 'none' : '';
+      }
+    }
+    if (stick) msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  /** 在子树里找第一个带指定 class 的元素（不依赖 querySelector 的选择器实现） */
+  function queryIn(root, cls) {
+    var kids = Array.prototype.slice.call(root.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].className && kids[i].className.split(/\s+/).indexOf(cls) >= 0) return kids[i];
+      var deep = queryIn(kids[i], cls);
+      if (deep) return deep;
+    }
+    return null;
+  }
+
+  function findByWid(wid) {
+    var all = msgsEl.children || [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute && all[i].getAttribute('data-wid') === String(wid)) return all[i];
+    }
+    return null;
+  }
+
+  function buildStreamingNode(wid, st) {
+    var d = el('div', 'ev ai streaming');
+    d.setAttribute('data-wid', String(wid));
+    d.style.setProperty('--id-h', hueOf(wid));
+    d.appendChild(el('div', 'av', initialOf(st.label)));
+    var col = el('div', 'col');
+    var hd = el('div', 'hd');
+    hd.appendChild(el('span', 'who', st.label || ('窗口 ' + wid)));
+    hd.appendChild(el('span', 'tm', '生成中'));
+    col.appendChild(hd);
+    var bub = el('div', 'bub');
+    var body = el('span', 'stream-body', st.text || '');
+    var dots = el('span', 'stream-dots');
+    dots.appendChild(el('i')); dots.appendChild(el('i')); dots.appendChild(el('i'));
+    bub.appendChild(body);
+    bub.appendChild(dots);
+    bub.appendChild(el('span', 'cursor'));
+    col.appendChild(bub);
+    d.appendChild(col);
+    return d;
+  }
+
   // ===================== 状态 =====================
   function renderStatus() {
     var busy = (state.chat.busy || []).length;
@@ -1013,12 +1196,26 @@
 
   // ===================== 轮询 =====================
   applyTheme('dark');
-  refresh();
-  setInterval(function () {
+  refresh().then(function () {
+    // 首次拿到端口后立刻接 SSE（端口可能被换过，所以放在 refresh 之后）
+    connectSse();
+  });
+
+  /**
+   * 轮询节奏：固定 1.5 秒。
+   *
+   * 曾经想过"SSE 连上就放慢"，但那会引入一类难查的延迟——比如切主题要等 5 秒才变。
+   * 本地 loopback 上一次 /status 的代价可以忽略，可预期比省这点开销重要得多。
+   * SSE 的职责是让流式输出顺滑，不是替代轮询。
+   */
+  function tick() {
     pullStatus().then(pullChat).then(function () {
       renderPeers(); renderSendTo(); renderMsgs(); renderStatus();
-    }, function () {});
-  }, 1500);
+    }, function () {}).then(function () {
+      setTimeout(tick, 1500);
+    });
+  }
+  setTimeout(tick, 1500);
 })();
 </script>
 </body>
