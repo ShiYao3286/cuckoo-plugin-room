@@ -18,8 +18,11 @@
 ## 特性
 
 - **`@` 指定对话对象**：选某一位就只发给他，选「全体」就发给所有选中的人
+- **Markdown 渲染**：AI 回复里的加粗、列表、代码块、表格、引用都正确呈现
 - **图片与文件上传**：📎 按钮、拖拽进窗口、<kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴截图
 - **跨平台**：不同窗口可以是不同平台或同一平台的不同账号
+- **身份色区分**：每个窗口一个稳定色相，同平台的不同账号也能一眼分清谁在说话
+- **跟随应用主题**：亮色/深色自动切换
 - **独立窗口**：不遮挡 AI 正文；关掉窗口也不中断正在进行的对话
 - **聊天记录落盘**：重启后还在，只存文字不存图片，文件不会膨胀
 
@@ -28,7 +31,7 @@
 ```
 cuckoo-plugin-room/
 ├── plugin.json              # 清单（唯一必需文件）
-├── providers/room-host.js   # ★ 主进程编排器：跨窗口收发、附件注入、开窗、按钮注入
+├── providers/room-host.js   # ★ 主进程编排器：跨窗口收发、附件注入、开窗、按钮注入、主题
 ├── ui/room-window.html      # 独立窗口的完整界面（应用内 BrowserWindow 加载）
 ├── ui/cuckoo-room.js        # AI 页面右上角的迷你入口（小胶囊，点它开独立窗口）
 ├── LICENSE
@@ -37,6 +40,36 @@ cuckoo-plugin-room/
 
 面板里显示的名字取自 `plugin.json` 的 `name`（中文「多 AI 同室」），与目录名无关。
 目录名同时是 `id`，按约定必须小写 kebab-case（`paths.ts:35`），所以目录名只能是英文。
+
+## 安全：Markdown 为什么是这里唯一破例的地方
+
+AI 的回复是**第三方内容**。整个插件其余部分一律用 `textContent` 渲染，
+只有 Markdown 这一处必须走 `innerHTML`——因为要产出真正的 HTML 标签。
+
+因此这里**不用正则消毒**（正则做 HTML 消毒必被绕过），而是**白名单重建**：
+
+1. `marked` 的输出先写进一个**游离节点**（不挂进文档，脚本不执行、资源不加载）
+2. 遍历这棵树，**只创建白名单里的标签**、**只复制白名单里的属性**，其余连子树一起丢弃
+3. 允许的标签：`p h1-h6 ul ol li strong em del code pre blockquote hr br table thead tbody tr th td a`
+4. `a[href]` 只放行 `http/https`——`javascript:` `data:` `vbscript:` `file:` 一律剥掉，并加 `rel="noreferrer noopener"`
+5. **故意不允许 `img`**：AI 若输出 `![](http://x/y.png)`，打开消息就会自动发请求，
+   等于把你的"已读"泄露给第三方。要看图可以点链接跳浏览器
+
+`verify-markdown.cjs` 对这套逻辑有 87 项专门测试（含 `javascript:` 变体、
+事件属性、嵌套绕过、表格内 iframe 等），并验证它在**真实渲染路径**上生效。
+
+## 主题跟随
+
+独立窗口是 `sandbox:true` 且没有 preload，拿不到 `electronAPI`，因此**读不到应用主题**。
+解决办法：主进程的编排器直接问主题权威单例（`theme-manager.js` 的 `snapshot()`），
+经已有的 `/status` 接口下发，页面每 1.5 秒轮询时自然跟着变。
+
+三级降级，任何一级失败都不会让页面失去配色：
+`theme-manager.snapshot()` → `nativeTheme.shouldUseDarkColors` → 兜底 `dark`。
+
+`marked` 的供给同理：不从仓库里带 46 KB 第三方库，而是从应用自带的
+`src/ui/vendor/marked.umd.js` 经 `/vendor/` 路由提供——**按文件名白名单放行**，
+只认 `marked.umd.js` 一个名字，其余（含各种路径穿越写法）一律 404。
 
 ## 聊天室怎么用
 
@@ -211,10 +244,14 @@ require('<appPath>/out/src/app/window.js').getAllContexts()
   带 `Authorization` 的跨源请求会先触发预检，预检不通过浏览器自己就拦下了。
   这样即使某个 AI 网页被注入恶意脚本，也无法驱动本服务。
   不带 `Origin` 的请求（本机 curl / PowerShell 排障）放行，方便你自己查问题。
-- 所有界面文本一律走 `textContent`，从不使用 `innerHTML`——AI 的回复是第三方内容，
-  当 HTML 渲染就等于给自己开 XSS 后门。独立窗口页面同样如此。
+- 界面文本默认走 `textContent`；**唯一**使用 `innerHTML` 的地方是 Markdown 渲染，
+  且必经白名单重建式消毒（详见上文「安全：Markdown 为什么是这里唯一破例的地方」）。
 - 独立窗口是**沙箱化**的（`contextIsolation:true, nodeIntegration:false, sandbox:true`），
   与官方「飞书配置教程」窗口同一套配置；它只加载 `127.0.0.1` 上的本机页面。
+- 独立窗口里的外链**不能就地导航**，一律交给系统默认浏览器打开
+  （否则点一下链接，聊天界面就被顶掉且回不去）。
+- `/vendor/` 路由**按文件名白名单**放行，只在册 `marked.umd.js` 一个名字，
+  其余（含各种路径穿越写法）一律 404。
 - 往壳页面注入的按钮**只用图片信标**打本机 HTTP，不发起 fetch、不读任何页面数据。
 - **附件注入只在目标页面内构造 `File` 对象并交给该页面的上传控件**，
   不发起任何外发请求、不读取页面上的其他数据（测试里有一条专门断言这一点）。
@@ -224,7 +261,7 @@ require('<appPath>/out/src/app/window.js').getAllContexts()
 ## 排障
 
 ```powershell
-# 服务与窗口列表（version 应为 0.5.0）
+# 服务与窗口列表（version 应为 0.6.0）
 Invoke-RestMethod http://127.0.0.1:18901/status | ConvertTo-Json -Depth 4
 
 # 逐个窗口问「你是谁、能不能收字」（只读，不会发送任何东西）

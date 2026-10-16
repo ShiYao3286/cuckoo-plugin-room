@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -608,6 +608,74 @@ function authorized(req) {
   return !!m && m[1].trim() === token();
 }
 
+// ===================== 主题检测 =====================
+/**
+ * 读应用当前主题（亮/暗）。
+ *
+ * 为什么不给独立窗口加 preload 直接暴露主题：那要改窗口配置，
+ * 而本文件已在主进程，直接问权威单例更省事。
+ * theme-manager.js 的打包版导出了 snapshot()，用与窗口表相同的 require 手法即可。
+ *
+ * 三级降级，任何一级失败都不会让页面拿不到配色：
+ *   1. theme-manager.snapshot().active.colorScheme  ← 最准（含用户主题与覆盖层）
+ *   2. nativeTheme.shouldUseDarkColors              ← 主进程原生配色
+ *   3. 'dark'                                        ← 兜底
+ */
+let _tm = undefined;
+function getThemeManager() {
+  if (_tm !== undefined) return _tm;
+  const file = resolveAppPath('out/src/app/theme/theme-manager.js')
+    || resolveAppPath('src/app/theme/theme-manager.js');
+  if (!file) { _tm = null; return null; }
+  try { _tm = requireFromHere(file); }
+  catch (e) { log('挂接 theme-manager 失败:', e && e.message); _tm = null; }
+  return _tm;
+}
+
+function currentColorScheme() {
+  try {
+    const tm = getThemeManager();
+    if (tm && typeof tm.snapshot === 'function') {
+      const snap = tm.snapshot();
+      const cs = snap && snap.active && snap.active.colorScheme;
+      if (cs === 'light' || cs === 'dark') return cs;
+    }
+  } catch (e) { log('读主题快照失败:', e && e.message); }
+  try {
+    const el = getElectron();
+    const nt = el && el.nativeTheme;
+    if (nt && typeof nt.shouldUseDarkColors === 'boolean') {
+      return nt.shouldUseDarkColors ? 'dark' : 'light';
+    }
+  } catch (_) { /* ignore */ }
+  return 'dark';
+}
+
+// ===================== 供应商资源（marked） =====================
+/**
+ * 把应用自带的 marked 提供给独立窗口。
+ *
+ * 为什么从 asar 里取而不是复制一份进插件：
+ *   1. 不必把 46KB 第三方库塞进插件仓库（也免了许可证与版本漂移问题）
+ *   2. 跟随应用升级
+ * 独立窗口是 sandbox 且只加载本机 loopback 页面，用 <script src> 引用本服务即可。
+ */
+const VENDOR_WHITELIST = { 'marked.umd.js': 'src/ui/vendor/marked.umd.js' };
+let _markedCache = null;
+
+function readVendor(name) {
+  const rel = VENDOR_WHITELIST[name];
+  if (!rel) return null;
+  if (_markedCache) return _markedCache;
+  const file = resolveAppPath('out/' + rel) || resolveAppPath(rel);
+  if (!file) { log('找不到 vendor 资源:', rel); return null; }
+  try {
+    _markedCache = fs.readFileSync(file);
+    log('已挂接 vendor:', rel, '(' + _markedCache.length + ' B)');
+    return _markedCache;
+  } catch (e) { log('读 vendor 失败:', e && e.message); return null; }
+}
+
 // ===================== 独立聊天室窗口 =====================
 /** 1×1 透明 GIF：图片信标的响应体 */
 const BEACON_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -654,19 +722,43 @@ async function openRoomWindow() {
   }
 
   try {
+    const scheme = currentColorScheme();
     roomWin = new el.BrowserWindow({
       width: 1040,
       height: 740,
       minWidth: 760,
       minHeight: 500,
       title: '多 AI 同室 · 聊天室',
-      backgroundColor: '#14161a',
+      // 首帧背景跟随主题，避免开窗时闪一下深色
+      backgroundColor: scheme === 'light' ? '#f7f8fa' : '#14161a',
       autoHideMenuBar: true,
       webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
     });
+
+    // 沙箱窗口里点外链不能就地导航（那会把聊天界面顶掉，且回不来）。
+    // 一律交给系统默认浏览器打开。
+    try {
+      roomWin.webContents.setWindowOpenHandler(({ url: target }) => {
+        try {
+          const el2 = getElectron();
+          if (el2 && el2.shell && /^https?:\/\//i.test(target)) el2.shell.openExternal(target);
+        } catch (_) { /* ignore */ }
+        return { action: 'deny' };
+      });
+      roomWin.webContents.on('will-navigate', (e, target) => {
+        // 只允许留在本服务内；其余（含 http 外链）交给系统浏览器
+        if (target === url || target.indexOf('http://127.0.0.1:' + listenPort + '/') === 0) return;
+        e.preventDefault();
+        try {
+          const el2 = getElectron();
+          if (el2 && el2.shell && /^https?:\/\//i.test(target)) el2.shell.openExternal(target);
+        } catch (_) { /* ignore */ }
+      });
+    } catch (e) { log('挂接外链处理失败:', e && e.message); }
+
     roomWin.on('closed', () => { roomWin = null; });
     roomWin.loadURL(url);
-    log('已打开聊天室窗口:', url);
+    log('已打开聊天室窗口:', url, '主题=' + scheme);
     return { ok: true, url: url };
   } catch (e) {
     const msg = (e && e.message) || String(e);
@@ -800,6 +892,8 @@ function handle(req, res) {
     json(res, 200, {
       ok: true, id: PLUGIN_ID, version: VERSION, pid: process.pid,
       port: listenPort, uptimeSec: Math.round(process.uptime()),
+      // 页面的亮/暗跟随应用主题（页面每 1.5 秒轮询 /status，天然会跟着变）
+      theme: currentColorScheme(),
       windowsOk: w.ok, windowCount: w.count || 0,
       windowError: w.error || null,
       windows: w.windows || [],
@@ -932,6 +1026,21 @@ function handle(req, res) {
       const r = await chatSend(body);
       json(res, 200, Object.assign({ attached: attached, failed: failed }, r));
     }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
+    return;
+  }
+
+  // ===== 应用自带的第三方资源（页面用 <script src> 引用）=====
+  // 只放行白名单里的文件名，不接受任意路径 —— 这等价于把 asar 里的文件开给本机页面读，
+  // 白名单是唯一防线，不能省。
+  if (p.indexOf('/vendor/') === 0) {
+    const name = decodeURIComponent(p.slice('/vendor/'.length));
+    const buf = readVendor(name);
+    if (!buf) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found'); return; }
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'public, max-age=3600',
+    });
+    res.end(buf);
     return;
   }
 
@@ -1105,6 +1214,9 @@ module.exports.__room = {
   injectShellButtons: injectShellButtons,
   buildShellInjectCode: buildShellInjectCode,
   readWindowHtml: readWindowHtml,
+  currentColorScheme: currentColorScheme,
+  readVendor: readVendor,
+  getThemeManager: getThemeManager,
   getRoomWin: function () { return roomWin; },
   logFile: LOG_FILE,
   tokenFile: TOKEN_FILE,
