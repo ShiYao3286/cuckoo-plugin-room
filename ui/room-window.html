@@ -169,6 +169,7 @@
   .ev .to{font-size:10.5px;color:var(--fg-3);margin-top:4px;display:flex;align-items:center;gap:5px}
   .ev.me .to{justify-content:flex-end}
   .ev .to .ic{opacity:.7}
+  .ev .to .ctxtag{opacity:.75;border-left:1px solid var(--line-2);padding-left:6px;margin-left:2px}
 
   /* ---------- Markdown ---------- */
   .md>*:first-child{margin-top:0}
@@ -223,8 +224,7 @@
     border:1px solid var(--line-2);color:var(--fg-2)}
   .ev .acts button:hover{background:var(--hover);color:var(--fg)}
 
-  /* 消息内的引用（"回复某某"） */
-  .ev .bub .qref{display:block;margin:-2px 0 7px;padding:5px 9px;border-left:2px solid var(--line-2);
+  /* 消息内的引用（"回复某某"） */  .ev .bub .qref{display:block;margin:-2px 0 7px;padding:5px 9px;border-left:2px solid var(--line-2);
     background:var(--code-bg);border-radius:0 6px 6px 0;font-size:11.5px;color:var(--fg-2);
     cursor:pointer;transition:border-color .13s}
   .ev .bub .qref:hover{border-left-color:var(--pri)}
@@ -281,6 +281,13 @@
     padding:1px 9px;color:var(--fg-2);transition:.12s}
   #sendTo .tg:hover{color:var(--err);border-color:var(--err-line)}
   #sendTo .none{color:var(--err)}
+  /* 上下文条数选择器 */
+  #sendTo .ctxpick{display:inline-flex;align-items:center;gap:3px;margin-left:auto;flex:none}
+  #sendTo .ctxpick .cl{color:var(--fg-3);font-size:10.5px}
+  #sendTo .ctxpick .cb{cursor:pointer;padding:1px 7px;border-radius:999px;font-size:10.5px;
+    color:var(--fg-3);border:1px solid transparent;transition:.12s}
+  #sendTo .ctxpick .cb:hover{color:var(--fg-2);background:var(--card)}
+  #sendTo .ctxpick .cb.on{background:var(--pri-soft);color:var(--pri);border-color:var(--pri)}
   .box{display:flex;gap:8px;align-items:flex-end;background:var(--card);border:1px solid var(--line-2);
     border-radius:var(--radius);padding:6px 8px;transition:border-color .15s,box-shadow .15s}
   .box:focus-within{border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-soft)}
@@ -435,6 +442,8 @@
     sse: 'off',
     // 当前引用：{ id, who, text } 或 null
     quote: null,
+    // 本次发送携带的历史条数（可调，0 = 不带）
+    ctxLimit: 14,
   };
 
   // ===================== 通信 =====================
@@ -678,6 +687,43 @@
       });
       sendToEl.appendChild(g);
     });
+    sendToEl.appendChild(renderCtxPicker());
+  }
+
+  /** 上下文条数选择器。
+   *
+   * 为什么要露出来：此前硬编码 14 条，用户既看不见也不知道 AI 到底看到了什么。
+   * 条数直接影响 token 消耗与 AI 的理解质量，应该让人可控。
+   */
+  var CTX_KEY = 'cuckoo.room.ctxLimit';
+  var CTX_OPTIONS = [0, 6, 14, 30];
+
+  function loadCtxLimit() {
+    try {
+      var v = parseInt(localStorage.getItem(CTX_KEY), 10);
+      if (Number.isFinite(v) && v >= 0 && v <= 60) return v;
+    } catch (e) {}
+    return 14;   // 与服务端默认值保持一致
+  }
+  function renderCtxPicker() {
+    var box = el('span', 'ctxpick');
+    box.appendChild(el('span', 'cl', '上下文'));
+    CTX_OPTIONS.forEach(function (n) {
+      var on = state.ctxLimit === n;
+      var b = el('span', 'cb' + (on ? ' on' : ''), n === 0 ? '关' : String(n));
+      b.title = n === 0
+        ? '不带历史，只发本次内容（最省 token）'
+        : ('发送时自动附带最近 ' + n + ' 条记录，让 AI 知道前因后果');
+      b.addEventListener('click', function () {
+        state.ctxLimit = n;
+        // 独立窗口没有 ctx（那是插件实例的 API），用 localStorage 记住选择。
+        // 页面来自 http://127.0.0.1:<port>，同源即可，端口变了会重置——可接受。
+        try { localStorage.setItem(CTX_KEY, String(n)); } catch (e) {}
+        renderSendTo();
+      });
+      box.appendChild(b);
+    });
+    return box;
   }
 
   // ===================== 渲染：消息 =====================
@@ -818,6 +864,15 @@
       to.appendChild(el('span', 'ic', '→'));
       to.appendChild(el('span', null, m.targets.map(function (t) { return t.label; }).join('、')
         + (m.mode === 'sequential' ? '（顺序）' : '')));
+      // 本次实际带了多少历史。ctxUsed 由服务端回填（它才知道真实条数：
+      // 消息变少、被排除、记录被截断等情况都可能让实际值小于设定值）
+      if (typeof m.ctxUsed === 'number') {
+        var ctxTag = el('span', 'ctxtag', m.ctxUsed > 0 ? ('带 ' + m.ctxUsed + ' 条上文') : '未带上文');
+        ctxTag.title = m.ctxUsed > 0
+          ? '本条发送时附带了最近 ' + m.ctxUsed + ' 条记录'
+          : '本条未附带历史记录（只发了内容本身）';
+        to.appendChild(ctxTag);
+      }
       col.appendChild(to);
     }
 
@@ -1299,6 +1354,8 @@
       text: text,
       targets: t.map(function (w) { return w.windowId; }),
       mode: 'parallel',
+      // 本次带多少历史（0 = 不带）。服务端会回填实际条数到消息的 ctxUsed
+      contextLimit: state.ctxLimit,
       // 引用的原文由后端按 id 从记录里查；这里只传 id 与快照兜底
       quote: state.quote ? { id: state.quote.id, who: state.quote.who, text: state.quote.text } : null,
       files: state.attachments.map(function (a) {
@@ -1397,6 +1454,7 @@
 
   // ===================== 轮询 =====================
   applyTheme('dark');
+  state.ctxLimit = loadCtxLimit();
   // 页面加载时若 marked 缺席（静态 <script> 拉取失败/服务未就绪），立刻补一次
   ensureMarked();
   refresh().then(function () {

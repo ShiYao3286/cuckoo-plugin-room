@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -497,13 +497,27 @@ function chatSnapshot() {
   };
 }
 
-/** 把最近 N 条聊天记录整理成给 AI 看的上下文 */
-function buildChatContext(limit) {
-  const n = Math.max(0, Number(limit) || 14);
-  const recent = chat.messages.filter((m) => m.role === 'user' || m.role === 'ai').slice(-n);
-  if (!recent.length) return '';
+/**
+ * 把最近 N 条聊天记录整理成给 AI 看的上下文。
+ *
+ * @param limit    取最近几条（0 = 不带上下文）
+ * @param excludeId 要排除的消息 id —— 即"本次正在发的那条"。
+ *
+ * 为什么要 excludeId 而不是靠调用顺序：早先的写法是"在 pushMsg 之前取上下文"，
+ * 但顺序模式会逐个参与者重新取（后一位要看到前一位刚说的），那时当前消息已在记录里，
+ * 于是它同时出现在上下文和正文里。靠顺序约束太脆弱，直接按 id 排除才稳。
+ *
+ * @returns { text, count } —— count 是真正带进去的条数，回给界面显示
+ */
+function buildChatContext(limit, excludeId) {
+  const n = Math.max(0, Number(limit));
+  if (!n) return { text: '', count: 0 };
+  let recent = chat.messages.filter((m) => m.role === 'user' || m.role === 'ai');
+  if (excludeId) recent = recent.filter((m) => m.id !== excludeId);
+  recent = recent.slice(-n);
+  if (!recent.length) return { text: '', count: 0 };
   const lines = recent.map((m) => (m.role === 'user' ? ('我：' + m.text) : ((m.who || 'AI') + '：' + m.text)));
-  return lines.join('\n');
+  return { text: lines.join('\n'), count: recent.length };
 }
 
 /**
@@ -563,13 +577,15 @@ async function chatSend(body) {
   if (!targets.length) return { ok: false, error: '没有可用的对话对象（请先打开 AI 窗口）' };
 
   const mode = body.mode === 'sequential' ? 'sequential' : 'parallel';
-  const withContext = body.withContext !== false;
-  const quoteBlock = buildQuoteBlock(body.quote);
-
-  // 顺序很重要：必须在 pushMsg 之前取上下文。
-  // 否则当前这条消息已经被算进"最近 14 条"里，于是它在提示词里出现两次
-  // ——一次作为历史，一次作为正式发言。既浪费 token，又可能让 AI 以为用户说了两遍。
-  const baseContext = withContext ? buildChatContext(14) : '';
+  // 上下文条数：本次请求 > 配置默认值。0 = 不带上下文。
+  // 兼容旧的 withContext:false（等价于 0），避免老调用方行为突变。
+  let ctxLimit;
+  if (body.withContext === false) ctxLimit = 0;
+  else {
+    const raw = body.contextLimit != null ? body.contextLimit : cfg.contextLimit;
+    const v = Number(raw);
+    ctxLimit = Number.isFinite(v) ? Math.max(0, Math.min(60, v)) : 0;
+  }
 
   const userMsg = pushMsg({
     role: 'user', who: '我', text: text,
@@ -582,14 +598,28 @@ async function chatSend(body) {
   });
 
   chat.sending = true;
-  // 提示词组装顺序：历史上下文 → 引用原文 → 本次发言
-  const prefix = (baseContext ? (baseContext + '\n\n---\n') : '') + quoteBlock;
+
+  // 引用块在这里算一次就够：它只依赖入参，不随轮次变化
+  const quoteBlock = buildQuoteBlock(body.quote);
+
+  /**
+   * 组一份提示词前缀。每次调用都重新取上下文（顺序模式下后一位要看到前一位刚说的），
+   * 并显式排除当前这条 —— 否则它会在上下文和正文里各出现一次。
+   */
+  const buildPrefix = () => {
+    const ctx = ctxLimit ? buildChatContext(ctxLimit, userMsg.id) : { text: '', count: 0 };
+    return { prefix: (ctx.text ? (ctx.text + '\n\n---\n') : '') + quoteBlock, count: ctx.count };
+  };
+
+  const first = buildPrefix();
+  // 把"本次带了多少上下文"记在用户消息上，界面据此显示
+  userMsg.ctxUsed = first.count;
 
   const one = async (w) => {
     chat.busy[w.windowId] = true;
     streamStart(w.windowId, w.title || w.providerId);
     try {
-      const prompt = prefix + text;
+      const prompt = first.prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
       });
@@ -623,10 +653,10 @@ async function chatSend(body) {
           chat.busy[w.windowId] = true;
           streamStart(w.windowId, w.title || w.providerId);
           try {
-            // 顺序模式下每轮重新取上下文（后一位要看到前一位刚说的），
-            // 但引用块是固定的，直接复用
-            const ctxNow = withContext ? buildChatContext(14) : '';
-            const prompt = (ctxNow ? (ctxNow + '\n\n---\n') : '') + quoteBlock + text;
+            // 顺序模式下每轮重新取上下文（后一位要看到前一位刚说的）。
+            // buildPrefix 内部会排除当前这条消息，所以不会重复。
+            const now = buildPrefix();
+            const prompt = now.prefix + text;
             const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
               onProgress: (tx) => streamDelta(w.windowId, tx),
             });
@@ -753,7 +783,12 @@ function streamEnd(windowId, finalText, error) {
 
 // ===================== 配置与令牌 =====================
 function readConfig() {
-  const out = { host: '127.0.0.1', hostPort: 18901, autoStart: true, enabled: true, replyTimeoutMs: 180000, maxAttachMB: 20 };
+  const out = {
+    host: '127.0.0.1', hostPort: 18901, autoStart: true, enabled: true,
+    replyTimeoutMs: 180000, maxAttachMB: 20,
+    // 每次发送自动携带的历史条数（0 = 不带）。此前硬编码 14，用户既看不见也改不了。
+    contextLimit: 14,
+  };
   try {
     const file = path.join(USER_DIR, 'plugins-config.json');
     if (fs.existsSync(file)) {
@@ -765,6 +800,11 @@ function readConfig() {
       if (c.enabled === false) out.enabled = false;
       if (c.replyTimeoutMs) out.replyTimeoutMs = Number(c.replyTimeoutMs) || out.replyTimeoutMs;
       if (c.maxAttachMB) out.maxAttachMB = Number(c.maxAttachMB) || out.maxAttachMB;
+      // 0 是合法值（明确表示不带上下文），所以不能用 truthy 判断
+      if (c.contextLimit != null) {
+        const v = Number(c.contextLimit);
+        if (Number.isFinite(v) && v >= 0) out.contextLimit = Math.min(60, v);
+      }
     }
   } catch (e) { log('读配置失败:', e && e.message); }
   return out;
@@ -1466,6 +1506,7 @@ module.exports.__room = {
   attachFileToWindow: attachFileToWindow,
   buildAttachCode: buildAttachCode,
   buildChatContext: buildChatContext,
+  buildQuoteBlock: buildQuoteBlock,
   openWindow: openRoomWindow,
   closeWindow: closeRoomWindow,
   injectShellButtons: injectShellButtons,
