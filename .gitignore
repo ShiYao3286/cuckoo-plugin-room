@@ -1,0 +1,14 @@
+# 运行时生成的文件（不该进版本库）
+.room-token
+.room-port
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 日志
+*.log

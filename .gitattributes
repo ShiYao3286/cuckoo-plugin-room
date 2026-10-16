@@ -1,0 +1,12 @@
+# 源码一律用 LF 落库。
+# 插件是通过 GitHub tarball 下载后原样落盘的，换行符会直接影响用户拿到的字节；
+# 固定 LF 可保证各平台拿到的文件与作者测试时一致。
+* text=auto eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

@@ -1,0 +1,34 @@
+{
+  "id": "cuckoo-room",
+  "name": "多 AI 同室",
+  "version": "0.5.0",
+  "description": "聊天室式的多 AI 协作：@ 指定谁或全体来对话、下任务，支持图片与文件上传。每个窗口是一个平台/账号，因此天然跨平台。",
+  "author": "ShiYao3286",
+  "minAppVersion": "0.8.8",
+  "config": {
+    "hostPort": {
+      "type": "number",
+      "label": "主进程服务端口",
+      "description": "主进程编排器的本地端口（只绑 127.0.0.1）。被占用时自动改用随机端口",
+      "default": 18901,
+      "min": 1024,
+      "max": 65535
+    },
+    "maxAttachMB": {
+      "type": "number",
+      "label": "附件大小上限（MB）",
+      "description": "单个图片/文件的体积上限，超过则拒绝发送",
+      "default": 20,
+      "min": 1,
+      "max": 100
+    },
+    "replyTimeoutMs": {
+      "type": "number",
+      "label": "单人回复超时（毫秒）",
+      "description": "某位参与者超过该时间未回复，就跳过并继续下一位",
+      "default": 180000,
+      "min": 15000,
+      "max": 900000
+    }
+  }
+}
