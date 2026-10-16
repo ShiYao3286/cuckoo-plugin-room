@@ -1,7 +1,7 @@
 {
   "id": "cuckoo-room",
   "name": "多 AI 同室",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "聊天室式的多 AI 协作：@ 指定谁或全体来对话、下任务，支持图片与文件上传，AI 回复按 Markdown 渲染。每个窗口是一个平台/账号，因此天然跨平台。",
   "author": "ShiYao3286",
   "minAppVersion": "0.8.8",

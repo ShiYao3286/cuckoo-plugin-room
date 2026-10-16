@@ -498,9 +498,15 @@
     try {
       if (window.marked && typeof window.marked.parse === 'function') {
         html = window.marked.parse(src, { gfm: true, breaks: true });
+        // marked 新版可能返回 Promise（异步扩展）；拿到 Promise 说明用法不对，
+        // 当作解析失败处理，而不是把 "[object Promise]" 渲染出去
+        if (html && typeof html.then === 'function') html = null;
       }
     } catch (e) { html = null; }
-    if (html == null) {                             // marked 没到位：退回纯文本
+    if (html == null) {
+      // 回退纯文本时**必须留痕**：否则「marked 没加载上」会表现成
+      // 「Markdown 不生效但界面一切正常」，排查时毫无线索。
+      markdownBroken = true;
       box.appendChild(document.createTextNode(src));
       return box;
     }
@@ -509,6 +515,9 @@
     sanitize(tpl, box);
     return box;
   }
+  /** marked 是否加载失败（首次渲染时探测，用于在界面上给出可见提示） */
+  var markdownBroken = false;
+  var markdownWarned = false;
 
   // ===================== 渲染：参与者 =====================
   function renderPeers() {
@@ -631,6 +640,14 @@
       msgsEl.appendChild(r);
     }
     if (stick) msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    // marked 没加载上 → 在界面上说清楚，而不是让用户对着字面星号猜
+    if (markdownBroken && !markdownWarned) {
+      markdownWarned = true;
+      setError('Markdown 渲染库没能加载（消息会以纯文本显示）。'
+        + '请检查 %USERPROFILE%\\.cuckoo\\cuckoo-room.log 里 "vendor" 相关记录。');
+      renderStatus();
+    }
   }
 
   function buildMsg(m) {

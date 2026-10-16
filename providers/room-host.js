@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -659,21 +659,55 @@ function currentColorScheme() {
  *   1. 不必把 46KB 第三方库塞进插件仓库（也免了许可证与版本漂移问题）
  *   2. 跟随应用升级
  * 独立窗口是 sandbox 且只加载本机 loopback 页面，用 <script src> 引用本服务即可。
+ *
+ * ⚠️ asar 里有两份同名文件，**必须挑对**：
+ *     src/ui/vendor/marked.umd.js   46973 B  真 UMD（应用自己用的就是这份）
+ *     out/src/ui/vendor/marked.umd.js 67050 B esbuild 转出来的 **ESM**（含 export）
+ * 先前按 out → src 的顺序找，结果把 ESM 版发给了浏览器：
+ * 经典 <script> 遇到顶层 export 直接抛 "Unexpected token 'export'"，
+ * 于是 window.marked 是 undefined，Markdown 静默退回纯文本 —— 界面上什么都看不出来。
+ * 现在改为「逐个候选读进来 + 校验可用性」，顺序不再重要。
  */
-const VENDOR_WHITELIST = { 'marked.umd.js': 'src/ui/vendor/marked.umd.js' };
-let _markedCache = null;
+const VENDOR_CANDIDATES = {
+  'marked.umd.js': [
+    'src/ui/vendor/marked.umd.js',      // 真 UMD，优先
+    'out/src/ui/vendor/marked.umd.js',  // 兜底（若是 ESM 会被下面的校验挡掉）
+  ],
+};
+const _vendorCache = {};
+
+/** 判断一段 JS 能否被经典 <script> 直接执行（顶层 export / import 会直接语法错误） */
+function isClassicScript(text) {
+  // 只看行首：字符串或注释里出现 export 不算
+  if (/^[ \t]*export[ \t{*]/m.test(text)) return false;
+  if (/^[ \t]*import[ \t{*"']/m.test(text)) return false;
+  return true;
+}
 
 function readVendor(name) {
-  const rel = VENDOR_WHITELIST[name];
-  if (!rel) return null;
-  if (_markedCache) return _markedCache;
-  const file = resolveAppPath('out/' + rel) || resolveAppPath(rel);
-  if (!file) { log('找不到 vendor 资源:', rel); return null; }
-  try {
-    _markedCache = fs.readFileSync(file);
-    log('已挂接 vendor:', rel, '(' + _markedCache.length + ' B)');
-    return _markedCache;
-  } catch (e) { log('读 vendor 失败:', e && e.message); return null; }
+  const cands = VENDOR_CANDIDATES[name];
+  if (!cands) return { ok: false, error: '不在白名单' };
+  if (_vendorCache[name]) return _vendorCache[name];
+
+  const tried = [];
+  for (const rel of cands) {
+    const file = resolveAppPath(rel);
+    if (!file) { tried.push(rel + '(不存在)'); continue; }
+    let text;
+    try { text = fs.readFileSync(file, 'utf-8'); }
+    catch (e) { tried.push(rel + '(读取失败: ' + e.message + ')'); continue; }
+    if (!isClassicScript(text)) {
+      tried.push(rel + '(是 ESM，经典 <script> 加载会语法错误)');
+      continue;
+    }
+    const buf = Buffer.from(text, 'utf-8');
+    log('已挂接 vendor:', rel, '(' + buf.length + ' B)');
+    _vendorCache[name] = { ok: true, buf: buf, from: rel };
+    return _vendorCache[name];
+  }
+  const err = '找不到可用的 ' + name + '：' + tried.join('；');
+  log(err);
+  return { ok: false, error: err };
 }
 
 // ===================== 独立聊天室窗口 =====================
@@ -1034,13 +1068,19 @@ function handle(req, res) {
   // 白名单是唯一防线，不能省。
   if (p.indexOf('/vendor/') === 0) {
     const name = decodeURIComponent(p.slice('/vendor/'.length));
-    const buf = readVendor(name);
-    if (!buf) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('not found'); return; }
+    const v = readVendor(name);
+    if (!v.ok) {
+      // 如实回报原因，别静默 404 —— 加载失败会让页面退回纯文本，界面上看不出来
+      log('vendor 请求失败:', name, v.error);
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('vendor not available: ' + v.error);
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
       'Cache-Control': 'public, max-age=3600',
     });
-    res.end(buf);
+    res.end(v.buf);
     return;
   }
 
