@@ -96,8 +96,31 @@
   #dot.err{background:var(--err)}
   @keyframes pulse{50%{opacity:.28}}
   header .sp{flex:1}
-  #status{color:var(--fg-2);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
+  #status{color:var(--fg-2);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:28%}
   #status.bad{color:var(--err)}
+
+  /* ---------- 话题切换 ---------- */
+  #topicWrap{position:relative;flex:none}
+  #topicBtn{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:7px;
+    background:var(--card);border:1px solid var(--line-2);color:var(--fg);font-size:12px;cursor:pointer;
+    max-width:200px;transition:.12s}
+  #topicBtn:hover{background:var(--hover)}
+  #topicBtn .tn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #topicBtn .tc{color:var(--fg-3);font-size:9px;flex:none}
+  #topicMenu{position:absolute;right:0;top:100%;margin-top:6px;min-width:220px;max-height:320px;overflow:auto;
+    background:var(--card);border:1px solid var(--line-2);border-radius:var(--radius);box-shadow:var(--shadow-lg);
+    display:none;z-index:30;padding:4px}
+  #topicMenu.show{display:block}
+  #topicMenu .ti{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:6px;cursor:pointer;font-size:12.5px}
+  #topicMenu .ti:hover{background:var(--hover)}
+  #topicMenu .ti.act{background:var(--pri-soft);color:var(--pri)}
+  #topicMenu .ti .tn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #topicMenu .ti .cnt{color:var(--fg-3);font-size:10.5px;flex:none}
+  #topicMenu .ti .del{color:var(--fg-3);font-size:12px;flex:none;padding:0 3px;border-radius:4px}
+  #topicMenu .ti .del:hover{color:var(--err);background:var(--card-2)}
+  #topicMenu .sep{height:1px;background:var(--line);margin:4px 2px}
+  #topicMenu .new{padding:6px 9px;border-radius:6px;cursor:pointer;font-size:12.5px;color:var(--pri)}
+  #topicMenu .new:hover{background:var(--pri-soft)}
 
   /* ---------- 错误横幅 ---------- */
   #banner{display:none;align-items:flex-start;gap:9px;padding:9px 14px;background:var(--err-bg);
@@ -342,6 +365,13 @@
   <header>
     <i id="dot"></i>
     <h1>多 AI 同室</h1>
+    <div id="topicWrap">
+      <div id="topicBtn" title="切换话题（不同话题互不干扰）">
+        <span class="tn" id="topicName">默认</span>
+        <span class="tc">▼</span>
+      </div>
+      <div id="topicMenu"></div>
+    </div>
     <span class="sp"></span>
     <div id="sse" class="off" title="流式输出连接状态"><i></i><span id="sse-txt">连接中</span></div>
     <div id="status">正在连接…</div>
@@ -406,6 +436,7 @@
   var lightbox = $('lightbox'), lightboxImg = $('lightbox-img');
   var sseEl = $('sse'), sseTxt = $('sse-txt');
   var quoteBar = $('quoteBar'), quoteWho = $('quoteWho'), quoteText = $('quoteText'), quoteX = $('quoteX');
+  var topicWrap = $('topicWrap'), topicBtn = $('topicBtn'), topicMenu = $('topicMenu'), topicNameEl = $('topicName');
 
   function setError(msg) {
     state.error = msg || '';
@@ -444,6 +475,9 @@
     quote: null,
     // 本次发送携带的历史条数（可调，0 = 不带）
     ctxLimit: 14,
+    // 话题（会话隔离）
+    topics: [],
+    activeTopic: '',
   };
 
   // ===================== 通信 =====================
@@ -736,7 +770,7 @@
   }
 
   function renderMsgs() {
-    var ms = state.chat.messages || [];
+    var ms = topicMessages();
     var prevCount = state.lastCount || 0;
     // 记录被清空（或换了一轮）→ 整体重绘
     if (ms.length < prevCount) { msgsEl.textContent = ''; state.seen = {}; }
@@ -1279,6 +1313,93 @@
     return null;
   }
 
+  // ===================== 话题 =====================
+  /** 当前话题下的消息（界面只显示这些） */
+  function topicMessages() {
+    var all = (state.chat && state.chat.messages) || [];
+    if (!state.activeTopic) return all;
+    return all.filter(function (m) { return !m.topic || m.topic === state.activeTopic; });
+  }
+
+  function currentTopic() {
+    for (var i = 0; i < state.topics.length; i++) {
+      if (state.topics[i].id === state.activeTopic) return state.topics[i];
+    }
+    return null;
+  }
+
+  function renderTopicBtn() {
+    var t = currentTopic();
+    topicNameEl.textContent = t ? t.title : '默认';
+    topicBtn.title = '当前话题：' + (t ? t.title : '默认') + '（不同话题的历史互不相通）';
+  }
+
+  function renderTopicMenu() {
+    topicMenu.textContent = '';
+    var all = (state.chat && state.chat.messages) || [];
+    state.topics.forEach(function (t) {
+      var row = el('div', 'ti' + (t.id === state.activeTopic ? ' act' : ''));
+      row.appendChild(el('span', 'tn', t.title));
+      var n = all.filter(function (m) { return m.topic === t.id; }).length;
+      row.appendChild(el('span', 'cnt', String(n)));
+      row.addEventListener('click', function (e) {
+        if (e.target && e.target.className === 'del') return;
+        switchTopic(t.id);
+      });
+      if (state.topics.length > 1) {
+        var del = el('span', 'del', '✕');
+        del.title = '删除这个话题（连同它的 ' + n + ' 条消息）';
+        del.addEventListener('click', function (e) {
+          e.stopPropagation();
+          if (!confirm('删除话题「' + t.title + '」？\n\n它下面的 ' + n + ' 条消息会一起删掉，不可恢复。')) return;
+          api('/topic/delete', { method: 'POST', body: { id: t.id } })
+            .then(applyTopicState).then(function () { closeTopicMenu(); return refresh(); }, function () {});
+        });
+        row.appendChild(del);
+      }
+      topicMenu.appendChild(row);
+    });
+    topicMenu.appendChild(el('div', 'sep'));
+    var add = el('div', 'new', '＋ 新建话题');
+    add.addEventListener('click', function () {
+      var title = prompt('新话题的名称：', '话题 ' + (state.topics.length + 1));
+      if (title == null) return;
+      api('/topic/create', { method: 'POST', body: { title: title } })
+        .then(applyTopicState).then(function () { closeTopicMenu(); return refresh(); }, function () {});
+    });
+    topicMenu.appendChild(add);
+  }
+
+  /** 把接口返回的话题状态写进本地 */
+  function applyTopicState(r) {
+    if (!r) return;
+    if (Array.isArray(r.topics)) state.topics = r.topics;
+    if (typeof r.activeTopic === 'string') state.activeTopic = r.activeTopic;
+    renderTopicBtn();
+  }
+
+  function switchTopic(id) {
+    if (id === state.activeTopic) { closeTopicMenu(); return; }
+    api('/topic/active', { method: 'POST', body: { id: id } }).then(applyTopicState).then(function () {
+      closeTopicMenu();
+      // 换话题等于换一屏内容：清掉已渲染标记并重绘
+      msgsEl.textContent = '';
+      state.lastCount = 0;
+      return refresh();
+    }, function () {});
+  }
+
+  function closeTopicMenu() { topicMenu.className = ''; }
+
+  topicBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (topicMenu.className.indexOf('show') >= 0) { closeTopicMenu(); return; }
+    renderTopicMenu();
+    topicMenu.className = 'show';
+  });
+  document.addEventListener('click', function () { closeTopicMenu(); });
+  topicMenu.addEventListener('click', function (e) { e.stopPropagation(); });
+
   // ===================== 状态 =====================
   function renderStatus() {
     var busy = (state.chat.busy || []).length;
@@ -1336,6 +1457,18 @@
     return api('/chat/status').then(function (r) {
       state.chat = r.chat || state.chat;
       state.alive = true;
+      // 话题列表由服务端权威下发（它是唯一知道全量消息归属的地方）
+      if (Array.isArray(r.chat && r.chat.topics)) state.topics = r.chat.topics;
+      if (typeof (r.chat || {}).activeTopic === 'string') {
+        var prev = state.activeTopic;
+        state.activeTopic = r.chat.activeTopic;
+        // 别处（比如另一个窗口）切了话题，这边要跟着换屏
+        if (prev && prev !== state.activeTopic) {
+          msgsEl.textContent = '';
+          state.lastCount = 0;
+        }
+      }
+      renderTopicBtn();
     }, function () {});
   }
   function refresh() {
@@ -1354,6 +1487,8 @@
       text: text,
       targets: t.map(function (w) { return w.windowId; }),
       mode: 'parallel',
+      // 发到当前话题
+      topic: state.activeTopic,
       // 本次带多少历史（0 = 不带）。服务端会回填实际条数到消息的 ctxUsed
       contextLimit: state.ctxLimit,
       // 引用的原文由后端按 id 从记录里查；这里只传 id 与快照兜底
@@ -1448,8 +1583,17 @@
 
   btnRefresh.addEventListener('click', function () { refresh(); });
   btnClear.addEventListener('click', function () {
-    if (!confirm('清空聊天记录？')) return;
-    api('/chat/clear', { method: 'POST' }).then(refresh, refresh);
+    var t = currentTopic();
+    // 有了话题隔离后，清空只清当前话题 —— 清全部会误伤其它话题，太危险。
+    // 想全清就逐个删话题，或者手工删记录文件。
+    var msg = '清空当前话题「' + (t ? t.title : '默认') + '」的消息？\n\n'
+      + '其它话题不受影响。此操作不可恢复。';
+    if (!confirm(msg)) return;
+    api('/chat/clear', { method: 'POST', body: { topic: state.activeTopic } }).then(function () {
+      msgsEl.textContent = '';
+      state.lastCount = 0;
+      return refresh();
+    }, function () { refresh(); });
   });
 
   // ===================== 轮询 =====================

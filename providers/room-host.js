@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -450,8 +450,102 @@ async function attachFileToWindow(wc, file) {
  */
 const CHAT_FILE = path.join(USER_DIR, 'cuckoo-room-chat.json');
 const MAX_MESSAGES = 500;
-const chat = { messages: [], seq: 0, busy: {}, sending: false };
+const chat = { messages: [], seq: 0, busy: {}, sending: false, topics: [], activeTopic: '' };
 let chatSaveTimer = null;
+
+/**
+ * 话题（会话隔离）。
+ *
+ * 为什么需要：所有对话挤在一条流里时，多话题并行会互相污染——
+ * 聊代码时上下文里夹着刚才聊天气的记录，AI 容易被带偏，也白费 token。
+ * 给消息打上 topic，取上下文时只取同话题的。
+ *
+ * 用 id 而不是标题做键：标题可以随时改，历史消息不必跟着回填。
+ */
+const DEFAULT_TOPIC = '默认';
+
+/** 生成一个不冲突的话题 id */
+function newTopicId() {
+  let n = chat.topics.length + 1;
+  let id = 't' + n;
+  const used = new Set(chat.topics.map((t) => t.id));
+  while (used.has(id)) { n++; id = 't' + n; }
+  return id;
+}
+
+/** 确保记录里至少有一个话题，且 activeTopic 合法 */
+function ensureTopics() {
+  if (!Array.isArray(chat.topics)) chat.topics = [];
+  if (!chat.topics.length) {
+    chat.topics.push({ id: 't1', title: DEFAULT_TOPIC, at: Date.now() });
+  }
+  const ids = new Set(chat.topics.map((t) => t.id));
+  if (!chat.activeTopic || !ids.has(chat.activeTopic)) {
+    chat.activeTopic = chat.topics[chat.topics.length - 1].id;
+  }
+}
+
+/**
+ * 旧记录迁移：v0.9.0 之前的消息没有 topic 字段。
+ * 全部归到默认话题，避免升级后历史消息"消失"。
+ */
+function migrateTopics() {
+  ensureTopics();
+  const first = chat.topics[0];
+  let moved = 0;
+  for (const m of chat.messages) {
+    if (!m.topic) { m.topic = first.id; moved++; }
+  }
+  if (moved) log('已把 ' + moved + ' 条旧记录归入「' + first.title + '」');
+  ensureTopics();
+}
+
+function createTopic(title) {
+  ensureTopics();
+  const clean = String(title || '').trim().slice(0, 40) || ('话题 ' + (chat.topics.length + 1));
+  const t = { id: newTopicId(), title: clean, at: Date.now() };
+  chat.topics.push(t);
+  chat.activeTopic = t.id;
+  saveChatSoon();
+  log('新建话题「' + clean + '」id=' + t.id);
+  return t;
+}
+
+function renameTopic(id, title) {
+  const t = chat.topics.find((x) => x.id === id);
+  if (!t) return { ok: false, error: '话题不存在' };
+  const clean = String(title || '').trim().slice(0, 40);
+  if (!clean) return { ok: false, error: '标题不能为空' };
+  t.title = clean;
+  saveChatSoon();
+  return { ok: true, topic: t };
+}
+
+/** 删除话题：连同它的消息一起删。最后一个话题不允许删。 */
+function deleteTopic(id) {
+  ensureTopics();
+  if (chat.topics.length <= 1) return { ok: false, error: '至少要保留一个话题' };
+  const idx = chat.topics.findIndex((x) => x.id === id);
+  if (idx < 0) return { ok: false, error: '话题不存在' };
+  const gone = chat.topics[idx];
+  const removed = chat.messages.filter((m) => m.topic === id).length;
+  chat.topics.splice(idx, 1);
+  chat.messages = chat.messages.filter((m) => m.topic !== id);
+  if (chat.activeTopic === id) chat.activeTopic = chat.topics[0].id;
+  saveChatSoon();
+  log('删除话题「' + gone.title + '」，连同 ' + removed + ' 条消息');
+  return { ok: true, removed: removed };
+}
+
+function setActiveTopic(id) {
+  ensureTopics();
+  const t = chat.topics.find((x) => x.id === id);
+  if (!t) return { ok: false, error: '话题不存在' };
+  chat.activeTopic = t.id;
+  saveChatSoon();
+  return { ok: true, topic: t };
+}
+
 
 function loadChat() {
   try {
@@ -459,10 +553,24 @@ function loadChat() {
     const raw = JSON.parse(fs.readFileSync(CHAT_FILE, 'utf-8'));
     if (raw && Array.isArray(raw.messages)) {
       chat.messages = raw.messages.slice(-MAX_MESSAGES);
-      chat.seq = Number(raw.seq) || 0;
-      log('已载入聊天记录 ' + chat.messages.length + ' 条');
+      // seq 不能只信任文件里的值：文件可能缺这个字段（手工编辑、写盘中断、旧版本），
+      // 一旦归零，新消息就会产生与历史重复的 id（m1 撞 m1），
+      // 进而破坏引用跳转与界面的"已渲染"判断。
+      // 所以取 max(文件里的 seq, 已有消息 id 的最大值) 作为起点。
+      let maxIdNum = 0;
+      for (const m of chat.messages) {
+        const n = parseInt(String(m && m.id || '').replace(/^m/, ''), 10);
+        if (Number.isFinite(n) && n > maxIdNum) maxIdNum = n;
+      }
+      chat.seq = Math.max(maxIdNum, Number(raw.seq) || 0);
+      // 话题列表也持久化，否则重启后话题会丢
+      if (Array.isArray(raw.topics)) chat.topics = raw.topics;
+      if (typeof raw.activeTopic === 'string') chat.activeTopic = raw.activeTopic;
+      log('已载入聊天记录 ' + chat.messages.length + ' 条（seq=' + chat.seq + '）');
     }
   } catch (e) { log('读聊天记录失败:', e && e.message); }
+  // 无论有没有文件都要跑：保证话题结构始终合法
+  migrateTopics();
 }
 
 function saveChatSoon() {
@@ -471,7 +579,12 @@ function saveChatSoon() {
     chatSaveTimer = null;
     try {
       fs.mkdirSync(USER_DIR, { recursive: true });
-      fs.writeFileSync(CHAT_FILE, JSON.stringify({ seq: chat.seq, messages: chat.messages.slice(-MAX_MESSAGES) }, null, 0), 'utf-8');
+      fs.writeFileSync(CHAT_FILE, JSON.stringify({
+        seq: chat.seq,
+        topics: chat.topics,
+        activeTopic: chat.activeTopic,
+        messages: chat.messages.slice(-MAX_MESSAGES),
+      }, null, 0), 'utf-8');
     } catch (e) { log('写聊天记录失败:', e && e.message); }
   }, 400);
 }
@@ -481,6 +594,8 @@ function pushMsg(m) {
   const msg = Object.assign({
     id: 'm' + chat.seq,
     at: Date.now(),
+    // 每条消息都归属一个话题（会话隔离的基础）
+    topic: chat.activeTopic,
   }, m);
   chat.messages.push(msg);
   if (chat.messages.length > MAX_MESSAGES) chat.messages.splice(0, chat.messages.length - MAX_MESSAGES);
@@ -489,11 +604,14 @@ function pushMsg(m) {
 }
 
 function chatSnapshot() {
+  ensureTopics();
   return {
     messages: chat.messages,
     busy: Object.keys(chat.busy).filter((k) => chat.busy[k]),
     sending: chat.sending,
     seq: chat.seq,
+    topics: chat.topics,
+    activeTopic: chat.activeTopic,
   };
 }
 
@@ -502,17 +620,26 @@ function chatSnapshot() {
  *
  * @param limit    取最近几条（0 = 不带上下文）
  * @param excludeId 要排除的消息 id —— 即"本次正在发的那条"。
+ * @param topicId  只取这个话题的记录。不传则用当前活跃话题。
  *
  * 为什么要 excludeId 而不是靠调用顺序：早先的写法是"在 pushMsg 之前取上下文"，
  * 但顺序模式会逐个参与者重新取（后一位要看到前一位刚说的），那时当前消息已在记录里，
  * 于是它同时出现在上下文和正文里。靠顺序约束太脆弱，直接按 id 排除才稳。
  *
+ * 为什么要 topicId：多话题并行时，聊代码的上下文里夹着聊天气的记录，
+ * 既容易把 AI 带偏，也白费 token。
+ *
  * @returns { text, count } —— count 是真正带进去的条数，回给界面显示
  */
-function buildChatContext(limit, excludeId) {
+function buildChatContext(limit, excludeId, topicId) {
   const n = Math.max(0, Number(limit));
   if (!n) return { text: '', count: 0 };
+  ensureTopics();
+  const topic = topicId || chat.activeTopic;
+
   let recent = chat.messages.filter((m) => m.role === 'user' || m.role === 'ai');
+  // 只取同话题。旧消息若没 topic 字段（理论上迁移后不会有），退而当作默认话题
+  recent = recent.filter((m) => (m.topic || chat.topics[0].id) === topic);
   if (excludeId) recent = recent.filter((m) => m.id !== excludeId);
   recent = recent.slice(-n);
   if (!recent.length) return { text: '', count: 0 };
@@ -587,6 +714,14 @@ async function chatSend(body) {
     ctxLimit = Number.isFinite(v) ? Math.max(0, Math.min(60, v)) : 0;
   }
 
+  // 话题：请求可以指定，否则用当前活跃话题。指定时顺带切过去，
+  // 否则用户"发到话题 A"之后界面还停在话题 B，观感上像发错了地方。
+  ensureTopics();
+  if (body.topic && chat.topics.some((t) => t.id === body.topic)) {
+    chat.activeTopic = body.topic;
+  }
+  const topicId = chat.activeTopic;
+
   const userMsg = pushMsg({
     role: 'user', who: '我', text: text,
     targets: targets.map((t) => ({ windowId: t.windowId, label: t.title || t.providerId })),
@@ -607,7 +742,7 @@ async function chatSend(body) {
    * 并显式排除当前这条 —— 否则它会在上下文和正文里各出现一次。
    */
   const buildPrefix = () => {
-    const ctx = ctxLimit ? buildChatContext(ctxLimit, userMsg.id) : { text: '', count: 0 };
+    const ctx = ctxLimit ? buildChatContext(ctxLimit, userMsg.id, topicId) : { text: '', count: 0 };
     return { prefix: (ctx.text ? (ctx.text + '\n\n---\n') : '') + quoteBlock, count: ctx.count };
   };
 
@@ -1237,10 +1372,68 @@ function handle(req, res) {
     return;
   }
 
+  // 清空：只清当前话题的消息（有了话题隔离后，清空全部会误伤其它话题）。
+  // 传 all:true 才清全部。
   if (p === '/chat/clear' && req.method === 'POST') {
-    chat.messages = [];
-    saveChatSoon();
-    json(res, 200, { ok: true });
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      ensureTopics();
+      if (body && body.all === true) {
+        const n = chat.messages.length;
+        chat.messages = [];
+        saveChatSoon();
+        json(res, 200, { ok: true, cleared: n, scope: 'all' });
+        return;
+      }
+      const before = chat.messages.length;
+      chat.messages = chat.messages.filter((m) => m.topic !== chat.activeTopic);
+      saveChatSoon();
+      json(res, 200, { ok: true, cleared: before - chat.messages.length, scope: 'topic' });
+    }).catch(() => json(res, 200, { ok: true, scope: 'topic' }));
+    return;
+  }
+
+  // ===== 话题 =====
+  if (p === '/topic/list') { ensureTopics(); json(res, 200, { ok: true, topics: chat.topics, activeTopic: chat.activeTopic }); return; }
+
+  if (p === '/topic/create' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      const t = createTopic(body && body.title);
+      json(res, 200, { ok: true, topic: t, topics: chat.topics, activeTopic: chat.activeTopic });
+    }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
+    return;
+  }
+
+  if (p === '/topic/rename' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      const r = renameTopic(body && body.id, body && body.title);
+      json(res, 200, Object.assign({ topics: chat.topics, activeTopic: chat.activeTopic }, r));
+    }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
+    return;
+  }
+
+  if (p === '/topic/delete' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      const r = deleteTopic(body && body.id);
+      json(res, 200, Object.assign({ topics: chat.topics, activeTopic: chat.activeTopic }, r));
+    }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
+    return;
+  }
+
+  if (p === '/topic/active' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      const r = setActiveTopic(body && body.id);
+      json(res, 200, Object.assign({ topics: chat.topics, activeTopic: chat.activeTopic }, r));
+    }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
     return;
   }
 
@@ -1507,6 +1700,11 @@ module.exports.__room = {
   buildAttachCode: buildAttachCode,
   buildChatContext: buildChatContext,
   buildQuoteBlock: buildQuoteBlock,
+  createTopic: createTopic,
+  renameTopic: renameTopic,
+  deleteTopic: deleteTopic,
+  setActiveTopic: setActiveTopic,
+  chatState: function () { return chat; },
   openWindow: openRoomWindow,
   closeWindow: closeRoomWindow,
   injectShellButtons: injectShellButtons,
