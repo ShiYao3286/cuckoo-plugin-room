@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.11.1';
+const VERSION = '0.12.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -146,8 +146,48 @@ function listWindows() {
   return { ok: true, count: out.length, windows: out };
 }
 
-/** 按 windowId / profileId / index 选一个可注入的窗口 */
-function pickTarget(sel) {
+/**
+ * 给一个窗口起「唯一且可被 @ 的名字」。
+ *
+ * 为什么不能用标题：两个 DeepSeek 窗口的标题可能一模一样，
+ * 于是上下文里出现两行「DeepSeek：…」，AI 根本分不清哪句是自己说的，
+ * 会把自己说过的话当成别人说的——接力跑到第二轮就会开始混乱。
+ *
+ * 做法：平台名 + 窗口序号，并保证整批不重复。全用不含空格的字符，
+ * 这样 `@名字` 能被简单的空白分词解析出来。
+ */
+function assignMentions(windows) {
+  const used = new Map();
+  const out = [];
+  for (const w of windows) {
+    let base = String(w.providerId || w.title || 'AI')
+      .replace(/\s+/g, '')          // @ 点名不能带空格
+      .replace(/[^\w\u4e00-\u9fa5-]/g, '')
+      .slice(0, 14) || 'AI';
+    let n = (used.get(base) || 0) + 1;
+    used.set(base, n);
+    // 同平台第 2 个起加序号；同时避开已有名字
+    let name = base + '-' + n;
+    while (out.some((x) => x.mention === name)) { n++; name = base + '-' + n; }
+    out.push({ mention: name, label: w.title || w.providerId || ('窗口 ' + w.windowId), windowId: w.windowId });
+  }
+  return out;
+}
+
+/** 解析文本里出现了哪些 mention（长的优先，避免前缀互相吃掉） */
+function parseMentions(text, mentions) {
+  if (!text) return [];
+  const sorted = mentions.slice().sort((a, b) => b.mention.length - a.mention.length);
+  const hit = [];
+  for (const m of sorted) {
+    // 用前后边界判断，避免 @AI-1 命中 @AI-10
+    const re = new RegExp('@' + m.mention.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w\\u4e00-\\u9fa5-])');
+    if (re.test(text)) hit.push(m);
+  }
+  return hit;
+}
+
+/** 按 windowId / profileId / index 选一个可注入的窗口 */function pickTarget(sel) {
   const list = listWindows();
   if (!list.ok) return { ok: false, error: list.error };
   let hit = null;
@@ -651,8 +691,7 @@ function buildChatContext(limit, excludeId, topicId) {
 }
 
 /**
- * 把"引用"整理成提示词前缀。
- *
+ * 把"引用"整理成提示词前缀。 *
  * 为什么需要它：@ 只能指定"发给谁"，没法指定"针对哪条"。
  * 想说"针对刚才那条"时，用户只能手动复述一遍，既啰嗦又容易失真。
  *
@@ -661,6 +700,57 @@ function buildChatContext(limit, excludeId, topicId) {
  * 截断上限 600 字 —— 引用整段长回复会把提示词撑爆，得不偿失。
  */
 const QUOTE_MAX = 600;
+
+// ===================== 成员互相对话（@ 触发接力）=====================
+/**
+ * 为什么用「@ 点名触发」而不是自动轮流发言：
+ *
+ * 自动轮流（甲答完给乙、乙答完给甲）一定会退化成互相客套——
+ * 没有任何机制让它停，只能靠轮数硬砍，砍在哪一轮都像是"没说完"。
+ *
+ * @ 触发则相反：AI 自己判断要不要叫别人。它不叫，链条自然结束。
+ * 这比任何轮数上限都可靠。maxHops 只是最后一道保险，防止互相 @ 死循环。
+ *
+ * 参考了 E:\反带ds\cuckoo补丁集合\工具本身修改\聊天室 的思路
+ * （那份补丁改的是 app.asar，与当前版本不兼容，只取设计）。
+ */
+const RELAY_MAX = 3;          // 一次用户发言最多引发几跳
+const relay = { on: false, depth: 0 };
+
+/** 会话的成员名册（每次发送时重算，因为窗口会开关） */
+function rosterOf(windows) {
+  return assignMentions(windows.map((w) => ({
+    providerId: w.providerId, title: w.title, windowId: w.windowId,
+  })));
+}
+
+/**
+ * 协作说明：让成员知道自己在多人房间里、别人叫什么、可以 @。
+ *
+ * 不写这段，AI 只会闷头回答，根本不知道可以叫别人——
+ * 那就退化成了普通的"广播给所有人"，接力永远不会发生。
+ */
+/**
+ * 协作说明：让成员知道自己在多人房间里、别人叫什么、可以 @。
+ *
+ * 单人房间不注入：房间里没有别人时这段全是废话，白费 token。
+ * 不写这段，AI 只会闷头回答、根本不知道可以叫别人，
+ * 那就退化成了普通的"广播给所有人"，接力永远不会发生。
+ */
+function buildRelayHeader(selfMention, roster, relayOn) {
+  const others = roster.filter((m) => m.mention !== selfMention);
+  if (!others.length) return '';    // 一个人不算"协作"，不占 token
+  const list = roster.map((m) => m.label + '（@' + m.mention + '）').join('、');
+  let s = '【多 AI 协作房间】你是 ' + selfMention + '。房间成员：' + list + '。\n';
+  s += '请优先把用户的活干好，回复简洁聚焦，不要寒暄。';
+  if (relayOn) {
+    s += '\n如果你确实需要别人配合（比如需要另一种模型复核、或需要人补上你缺的那部分），'
+      + '就在回复里 @' + others[0].mention + ' 并说明要他做什么；不需要就别 @。其他人会自动收到你的话。';
+  } else {
+    s += '\n你可以用 @' + others[0].mention + ' 这样的写法指代其他成员，但当前不会自动转发。';
+  }
+  return s + '\n\n';
+}
 
 function buildQuoteBlock(quote) {
   if (!quote || typeof quote !== 'object') return '';
@@ -740,6 +830,28 @@ async function chatSend(body) {
   // 引用块在这里算一次就够：它只依赖入参，不随轮次变化
   const quoteBlock = buildQuoteBlock(body.quote);
 
+  // 成员名册（唯一 mention）。
+  //
+  // 关键：名册必须是"房间里所有可用成员"，不能只用本次 targets。
+  // 否则 A 被单独发消息时，名册里只有 A 自己，它写 "@B" 解析不到，
+  // 接力永远不会发生——这正是第一版踩的坑。
+  const relayOn = body.relay != null ? !!body.relay : !!relay.on;
+  if (body.relay != null) relay.on = !!body.relay;
+  const allWindows = (listWindows().windows || []).filter((w) => !w.isSubagent && w.canInject);
+  const roster = rosterOf(allWindows);
+  // 本次 target 的 mention 必须能在名册里查到；查不到就补进去
+  for (const t of targets) {
+    if (!roster.some((r) => r.windowId === t.windowId)) {
+      roster.push({ mention: 'AI-' + t.windowId, label: t.title || t.providerId, windowId: t.windowId });
+    }
+  }
+  const mentionOf = (wid) => {
+    const hit = roster.find((r) => r.windowId === wid);
+    return hit ? hit.mention : ('AI-' + wid);
+  };
+  // 用户发言把接力深度归零
+  relay.depth = 0;
+
   /**
    * 组一份提示词前缀。每次调用都重新取上下文（顺序模式下后一位要看到前一位刚说的），
    * 并显式排除当前这条 —— 否则它会在上下文和正文里各出现一次。
@@ -757,13 +869,22 @@ async function chatSend(body) {
     chat.busy[w.windowId] = true;
     streamStart(w.windowId, w.title || w.providerId);
     try {
-      const prompt = first.prefix + text;
+      // 协作说明放在最前：让成员知道自己在房间里、别人叫什么
+      const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn);
+      const prompt = head + first.prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
       });
       if (res.ok) {
         streamEnd(w.windowId, res.text);
-        return pushMsg({ role: 'ai', who: w.title || w.providerId || ('窗口 ' + w.windowId), windowId: w.windowId, text: res.text, replyTo: userMsg.id });
+        const msg = pushMsg({
+          role: 'ai', who: w.title || w.providerId || ('窗口 ' + w.windowId),
+          windowId: w.windowId, mention: mentionOf(w.windowId),
+          text: res.text, replyTo: userMsg.id,
+        });
+        // 回复里 @ 了别人 → 触发接力（受 RELAY_MAX 限制）
+        maybeRelay(msg);
+        return msg;
       }
       streamEnd(w.windowId, '', res.error);
       pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」未回复：' + res.error, err: true, replyTo: userMsg.id });
@@ -773,6 +894,69 @@ async function chatSend(body) {
       throw e;
     } finally {
       chat.busy[w.windowId] = false;
+    }
+  };
+
+  /**
+   * 检查一条 AI 回复里是否 @ 了别人，是则由对方接话。
+   *
+   * 只在 relayOn 时生效；depth 每次用户发言归零，防止链条无限延伸。
+   * 用 setImmediate 起，避免在 one() 的返回路径里递归等待。
+   */
+  const maybeRelay = (msg) => {
+    if (!relayOn || !msg || !msg.text) return;
+    const hits = parseMentions(msg.text, roster).filter((m) => m.windowId !== msg.windowId);
+    if (!hits.length) return;
+    if (relay.depth >= RELAY_MAX) {
+      pushMsg({
+        role: 'system', who: '系统', err: true,
+        text: '接力已达上限 ' + RELAY_MAX + ' 跳，停止。' + msg.mention + ' 想找 '
+          + hits.map((h) => h.mention).join('、') + '，如需继续请自己发一句。',
+      });
+      return;
+    }
+    relay.depth++;
+    for (const h of hits) {
+      pushMsg({
+        role: 'system', who: '系统',
+        text: '接力 ' + relay.depth + '/' + RELAY_MAX + '：' + msg.mention + ' → ' + h.mention,
+      });
+      // 找到那个成员的窗口，把原话发过去
+      (async () => {
+        const tw = targets.find((t) => t.windowId === h.windowId)
+          || (listWindows().windows || []).find((t) => t.windowId === h.windowId);
+        if (!tw) {
+          pushMsg({ role: 'system', who: '系统', err: true, text: h.mention + ' 的窗口已不在，接力中断' });
+          return;
+        }
+        chat.busy[tw.windowId] = true;
+        streamStart(tw.windowId, tw.title || tw.providerId);
+        try {
+          const head = buildRelayHeader(h.mention, roster, relayOn);
+          const ctx = ctxLimit ? buildChatContext(ctxLimit, null, topicId) : { text: '', count: 0 };
+          const prompt = head
+            + (ctx.text ? (ctx.text + '\n\n---\n') : '')
+            + '【来自成员 ' + msg.mention + ' 的话】\n' + msg.text;
+          const res = await sendAndCapture(wcOf(tw), prompt, cfg.replyTimeoutMs, {
+            onProgress: (t) => streamDelta(tw.windowId, t),
+          });
+          if (res.ok) {
+            streamEnd(tw.windowId, res.text);
+            const m2 = pushMsg({
+              role: 'ai', who: tw.title || tw.providerId, windowId: tw.windowId,
+              mention: h.mention, text: res.text, relayed: true,
+            });
+            maybeRelay(m2);          // 允许继续接力
+          } else {
+            streamEnd(tw.windowId, '', res.error);
+            pushMsg({ role: 'system', who: '系统', err: true, text: h.mention + ' 未回复：' + res.error });
+          }
+        } catch (e) {
+          streamEnd(tw.windowId, '', (e && e.message) || String(e));
+        } finally {
+          chat.busy[tw.windowId] = false;
+        }
+      })();
     }
   };
 
@@ -794,13 +978,19 @@ async function chatSend(body) {
             // 顺序模式下每轮重新取上下文（后一位要看到前一位刚说的）。
             // buildPrefix 内部会排除当前这条消息，所以不会重复。
             const now = buildPrefix();
-            const prompt = now.prefix + text;
+            // 顺序模式也要带协作说明，否则成员不知道可以 @ 别人
+            const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn);
+            const prompt = head + now.prefix + text;
             const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
               onProgress: (tx) => streamDelta(w.windowId, tx),
             });
             if (res.ok) {
               streamEnd(w.windowId, res.text);
-              pushMsg({ role: 'ai', who: w.title || w.providerId, windowId: w.windowId, text: res.text, replyTo: userMsg.id });
+              const m = pushMsg({
+                role: 'ai', who: w.title || w.providerId, windowId: w.windowId,
+                mention: mentionOf(w.windowId), text: res.text, replyTo: userMsg.id,
+              });
+              maybeRelay(m);
             } else {
               streamEnd(w.windowId, '', res.error);
               pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」未回复：' + res.error, err: true });
@@ -1443,6 +1633,23 @@ function handle(req, res) {
     return;
   }
 
+  // ===== 接力开关 =====
+  if (p === '/relay' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      if (body && typeof body.on === 'boolean') relay.on = body.on;
+      relay.depth = 0;
+      log('接力已' + (relay.on ? '开启（最多 ' + RELAY_MAX + ' 跳）' : '关闭'));
+      json(res, 200, { ok: true, relay: relay.on, maxHops: RELAY_MAX });
+    }).catch(() => json(res, 200, { ok: true, relay: relay.on, maxHops: RELAY_MAX }));
+    return;
+  }
+  if (p === '/relay/status') {
+    json(res, 200, { ok: true, relay: relay.on, maxHops: RELAY_MAX, depth: relay.depth });
+    return;
+  }
+
   // ===== 话题 =====
   if (p === '/topic/list') { ensureTopics(); json(res, 200, { ok: true, topics: chat.topics, activeTopic: chat.activeTopic }); return; }
 
@@ -1749,6 +1956,11 @@ module.exports.__room = {
   buildAttachCode: buildAttachCode,
   buildChatContext: buildChatContext,
   buildQuoteBlock: buildQuoteBlock,
+  assignMentions: assignMentions,
+  parseMentions: parseMentions,
+  buildRelayHeader: buildRelayHeader,
+  relayState: function () { return relay; },
+  RELAY_MAX: RELAY_MAX,
   createTopic: createTopic,
   renameTopic: renameTopic,
   deleteTopic: deleteTopic,

@@ -151,6 +151,22 @@
   #topicMenu .inline button{padding:4px 10px;font-size:12px;border-radius:6px}
   #topicMenu .hint{padding:6px 9px;color:var(--fg-3);font-size:10.5px;line-height:1.5}
 
+  /* 接力开关 */
+  #relayWrap{display:flex;align-items:center;gap:5px;flex:none;font-size:11.5px;color:var(--fg-2);
+    cursor:pointer;user-select:none}
+  #relaySw{position:relative;width:30px;height:17px;border-radius:999px;background:var(--line-2);
+    transition:.16s;flex:none}
+  #relaySw.on{background:var(--pri)}
+  #relaySw::after{content:'';position:absolute;left:2px;top:2px;width:13px;height:13px;border-radius:50%;
+    background:#fff;transition:.16s}
+  #relaySw.on::after{left:15px}
+
+  /* 消息上的成员 @ 名 */
+  .ev .hd .mn{color:var(--fg-3);font-size:10.5px;font-family:ui-monospace,Consolas,monospace;
+    opacity:.75;margin-left:3px}
+  .ev .bub .relay-tag{display:inline-block;margin-bottom:6px;padding:1px 7px;border-radius:999px;
+    font-size:10.5px;background:var(--pri-soft);color:var(--pri)}
+
   /* ---------- 消息搜索 ---------- */
   #searchBar{display:none;align-items:center;gap:7px;padding:7px 14px;background:var(--chrome);
     border-bottom:1px solid var(--line);flex:none}
@@ -427,6 +443,9 @@
     </div>
     <span class="sp"></span>
     <div id="sse" class="off" title="流式输出连接状态"><i></i><span id="sse-txt">连接中</span></div>
+    <div id="relayWrap" title="开启后：AI 回复里 @ 别人会自动转发给对方（最多 3 跳，防止失控）">
+      <div id="relaySw"></div><span>接力</span>
+    </div>
     <div id="status">正在连接…</div>
     <button id="btn-refresh" class="icon" title="刷新">↻</button>
     <button id="btn-search" class="icon" title="搜索消息（Ctrl+F）">🔍</button>
@@ -517,6 +536,7 @@
   var cfmMask = $('cfmMask'), cfmTitle = $('cfmTitle'), cfmMsg = $('cfmMsg'), cfmYes = $('cfmYes'), cfmNo = $('cfmNo');
   var searchBarEl = $('searchBar'), searchInput = $('searchInput'), searchCountEl = $('searchCnt');
   var btnSearch = $('btn-search'), searchPrev = $('searchPrev'), searchNext = $('searchNext'), searchClose = $('searchClose');
+  var relayWrap = $('relayWrap'), relaySw = $('relaySw');
 
   /**
    * 危险操作确认。返回 Promise<boolean>。
@@ -584,6 +604,8 @@
     activeTopic: '',
     // 搜索
     search: { open: false, q: '', hits: [], cur: -1 },
+    // 接力开关（默认关：开着跑起来会连发多条，得让人主动选）
+    relay: false,
   };
 
   // ===================== 通信 =====================
@@ -961,10 +983,21 @@
     var col = el('div', 'col');
     var hd = el('div', 'hd');
     hd.appendChild(el('span', 'who', m.who || (me ? '我' : 'AI')));
+    // 成员的唯一 @ 名：两个同名平台的窗口靠它区分
+    if (m.mention) {
+      var mnEl = el('span', 'mn', '@' + m.mention);
+      mnEl.title = '在输入框里 @' + m.mention + ' 可指定发给这位';
+      hd.appendChild(mnEl);
+    }
     hd.appendChild(el('span', 'tm', fmtTime(m.at)));
     col.appendChild(hd);
 
     var bub = el('div', 'bub');
+
+    // 接力来的消息：标一下来源
+    if (!me && m.relayed) {
+      bub.appendChild(el('div', 'relay-tag', '接力 · 其他成员发来的'));
+    }
 
     // 被引用原文：显示在气泡最上方，点了能跳回那条消息
     if (m.quote && m.quote.text) {
@@ -1747,6 +1780,31 @@
     }
   });
 
+  // ===================== 接力 =====================
+  /**
+   * 接力开关。
+   *
+   * 默认关：开启后一次发言可能连发好几条调用，得让人主动选。
+   * 关掉时成员仍能看到彼此的名字（协作说明照发），只是 @ 不会转发。
+   */
+  function setRelay(on) {
+    state.relay = !!on;
+    relaySw.className = state.relay ? 'on' : '';
+    relayWrap.title = state.relay
+      ? '接力已开启：AI 回复里 @ 别人会自动转发给对方（最多 3 跳）'
+      : '接力已关闭：@ 不会自动转发。点这里开启';
+    return api('/relay', { method: 'POST', body: { on: state.relay } }).catch(function () {});
+  }
+
+  relayWrap.addEventListener('click', function () { setRelay(!state.relay); });
+
+  /** 从服务端同步接力状态（别的窗口可能改过） */
+  function pullRelay() {
+    return api('/relay/status').then(function (r) {
+      if (r && typeof r.relay === 'boolean' && r.relay !== state.relay) setRelay(r.relay);
+    }, function () {});
+  }
+
   // ===================== 状态 =====================
   function renderStatus() {
     var busy = (state.chat.busy || []).length;
@@ -1836,6 +1894,8 @@
       mode: 'parallel',
       // 发到当前话题
       topic: state.activeTopic,
+      // 接力开关：开启后成员回复里 @ 别人会自动转发
+      relay: state.relay,
       // 本次带多少历史（0 = 不带）。服务端会回填实际条数到消息的 ctxUsed
       contextLimit: state.ctxLimit,
       // 引用的原文由后端按 id 从记录里查；这里只传 id 与快照兜底
@@ -1993,6 +2053,9 @@
   // ===================== 轮询 =====================
   applyTheme('dark');
   state.ctxLimit = loadCtxLimit();
+  // 接力默认关；启动时问一下服务端（可能上次开着）
+  setRelay(false);
+  pullRelay();
   // 页面加载时若 marked 缺席（静态 <script> 拉取失败/服务未就绪），立刻补一次
   ensureMarked();
   refresh().then(function () {
