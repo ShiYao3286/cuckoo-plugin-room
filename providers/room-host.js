@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.13.0';
+const VERSION = '0.13.1';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -337,9 +337,23 @@ const STREAM_PEEK = '(function(){ var s = window.__ckRoomStream; return s ? { t:
  *        实现方式是从主进程轮询页面全局的增量出口 —— executeJavaScript 中途不返回，
  *        没有回调通道，轮询是这里最直接可靠的做法（250ms 一次，脚本极小）。
  */
+/**
+ * 发一条消息并等回复。
+ *
+ * @param opts.signal  AbortSignal —— 支持中途放弃。
+ *
+ * 为什么需要 signal：原先没有中断能力，用户点「停止」只是置了个标志，
+ * 正在跑的那一次调用仍要一直等到 replyTimeoutMs（默认 180 秒）才返回。
+ * "点了停止还要再等三分钟"是明确的坏体验。
+ *
+ * 注意能力边界：**无法真正掐断 AI 那边的生成**（我们只能通过
+ * executeJavaScript 观察页面，没有取消接口）。能做的是不再等待它——
+ * 立刻返回，让上层的循环尽快结束。
+ */
 async function sendAndCapture(wc, text, timeoutMs, opts) {
   const to = Math.max(15000, Math.min(900000, Number(timeoutMs) || 180000));
   const onProgress = opts && typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const signal = opts && opts.signal ? opts.signal : null;
 
   // 先装监听，再发送（同一 webContents 上两次 executeJavaScript 的顺序有保证）
   const capPromise = wc.executeJavaScript(buildCaptureCode(to), true)
@@ -366,6 +380,9 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
   }
   const stopPeekLoop = () => { stopPeek = true; if (peekTimer) clearTimeout(peekTimer); };
 
+  // 发送前就被叫停：不必再发
+  if (signal && signal.aborted) { stopPeekLoop(); return { ok: false, aborted: true, error: '已取消' }; }
+
   let sendRes;
   try { sendRes = await wc.executeJavaScript(buildSendCode(text), true); }
   catch (e) { stopPeekLoop(); return { ok: false, error: '注入失败: ' + (e && e.message) }; }
@@ -373,13 +390,25 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
   if (sendRes === 'SET_FAILED') { stopPeekLoop(); return { ok: false, error: '写入输入框失败' }; }
   if (sendRes !== 'SENT') { stopPeekLoop(); return { ok: false, error: '发送失败: ' + sendRes }; }
 
-  const res = await Promise.race([
+  // 等回复：正常完成 / 整体超时 / 用户取消，三者竞速
+  const racers = [
     capPromise,
     new Promise((r) => setTimeout(() => r({ text: '', reason: 'overall_timeout' }), to + 5000)),
-  ]);
+  ];
+  if (signal) {
+    racers.push(new Promise((r) => {
+      const onAbort = () => r({ text: '', reason: 'aborted' });
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }));
+  }
+  const res = await Promise.race(racers);
   stopPeekLoop();
 
   const reason = res && res.reason;
+  if (reason === 'aborted') {
+    return { ok: false, aborted: true, error: '已取消', partial: (res && res.text) || '' };
+  }
   if (reason === 'timeout' || reason === 'overall_timeout') {
     return { ok: false, error: '等待回复超时', partial: (res && res.text) || '' };
   }
@@ -960,10 +989,8 @@ async function chatSend(body) {
     }
   };
 
-  const wcOf = (w) => {
-    const t = pickTarget({ windowId: w.windowId });
-    return t.ok ? t.wc : null;
-  };
+  // 复用模块级的 wcOfWin，不再单独定义一份同样的实现
+  const wcOf = wcOfWin;
 
   (async () => {
     try {
@@ -1051,6 +1078,7 @@ const plan = {
   startedAt: 0,
   abort: false,      // 用户点了停止
   error: '',
+  ctrl: null,        // AbortController：让"停止"能立刻生效，不必等超时
 };
 
 function planOpen() {
@@ -1135,6 +1163,8 @@ function planStart(task, opts) {
   plan.startedAt = Date.now();
   plan.abort = false;
   plan.error = '';
+  plan.ctrl = new AbortController();
+  const sig = plan.ctrl.signal;
 
   const totalCalls = members.length * 2 + 1;   // 提案 + 评议 + 1 次汇总
 
@@ -1161,6 +1191,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(1, { roster, self: mention, task: text }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
+            signal: sig,
           });
           if (res.ok) {
             streamEnd(w.windowId, res.text);
@@ -1200,6 +1231,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(2, { roster, self: mention, task: text, proposals }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
+            signal: sig,
           });
           if (res.ok) {
             streamEnd(w.windowId, res.text);
@@ -1236,6 +1268,7 @@ function planStart(task, opts) {
       try {
         const res = await sendAndCapture(wcOfWin(sw), planPrompt(3, { roster, self: synthMention, task: text, proposals, reviews }), cfg.replyTimeoutMs, {
           onProgress: (t) => streamDelta(sw.windowId, t),
+          signal: sig,
         });
         if (res.ok) {
           streamEnd(sw.windowId, res.text);
@@ -1275,20 +1308,33 @@ function finishPlan(reason, isErr) {
   plan.stageName = '';
   plan.done = 0;
   plan.total = 0;
+  plan.ctrl = null;      // 别留着已结束的 controller
   if (reason) {
     pushMsg({ role: 'system', who: '系统', err: !!isErr, text: '分工讨论结束：' + reason });
   }
 }
 
-/** 取消进行中的分工讨论 */
+/**
+ * 取消进行中的分工讨论。
+ *
+ * 关键：要真的 abort，而不是只置个标志。
+ * 只置标志的话，正在进行的那次调用仍要等 replyTimeoutMs（默认 180 秒）——
+ * 用户点了"停止"却还要干等三分钟，等于没用。
+ */
 function planStop() {
   if (!plan.running) return { ok: false, error: '当前没有进行中的分工讨论' };
   plan.abort = true;
-  log('用户停止了分工讨论');
+  try { if (plan.ctrl) plan.ctrl.abort(); } catch (_) {}
+  log('用户停止了分工讨论（已中断正在进行的等待）');
   return { ok: true, stopping: true };
 }
 
-/** 取窗口的 webContents（plan 内部用，避免依赖闭包） */
+/**
+ * 取窗口的 webContents。
+ *
+ * 放在模块级（而不是 chatSend 里的闭包），因为 plan 也要用。
+ * 之前有两份逐字相同的实现（wcOf / wcOfWin），合并成这一份。
+ */
 function wcOfWin(w) {
   const t = pickTarget({ windowId: w.windowId });
   return t.ok ? t.wc : null;
