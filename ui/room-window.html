@@ -593,6 +593,7 @@
       <div id="moreWrap">
         <button id="btn-more" class="icon" title="更多">⋯</button>
         <div id="moreMenu">
+          <div class="mi" id="mi-action"><span>⚙ 显示动作</span><b id="actionState">关</b></div>
           <div class="mi" id="mi-claims"><span>📄 被改动的文件</span><b id="claimN">0</b></div>
           <div class="mi" id="mi-refresh"><span>↻ 刷新</span></div>
           <div class="mi danger" id="mi-clear"><span>🗑 清空本话题</span></div>
@@ -706,6 +707,7 @@
   var claimWrap = $('mi-claims'), claimN = $('claimN');
   var btnMore = $('btn-more'), moreMenu = $('moreMenu'), moreWrap = $('moreWrap');
   var miRefresh = $('mi-refresh'), miClear = $('mi-clear');
+  var miAction = $('mi-action'), actionState = $('actionState');
   var btnPlan = $('btn-plan'), planBar = $('planBar'), planTask = $('planTask');
   var planGo = $('planGo'), planCancel = $('planCancel'), planCost = $('planCost');
   var planProg = $('planProg'), planStageEl = $('planStage'), planBarFill = $('planBarFill');
@@ -771,7 +773,10 @@
     // 当前引用：{ id, who, text } 或 null
     quote: null,
     // 发言方式：parallel / sequential
-    mode: 'parallel',
+    mode: 'sequential',
+    // 是否在聊天流里显示「动作」（原始 JS）。默认关：
+    // 那是执行日志不是对话，铺出来喧宾夺主。
+    showAction: false,
     // 本次发送携带的历史条数（可调，0 = 不带）
     ctxLimit: 14,
     // 话题（会话隔离）
@@ -1051,13 +1056,17 @@
    * 这种事该让用户按任务自己决定，不该替他猜。
    */
   var MODE_KEY = 'cuckoo.room.mode';
+  var ACTION_KEY = 'cuckoo.room.showAction';
 
   function loadMode() {
     try {
       var v = localStorage.getItem(MODE_KEY);
       if (v === 'sequential' || v === 'parallel') return v;
     } catch (e) {}
-    return 'parallel';
+    // 默认「排队」。
+    // 实测并行时两个成员会干同一件事（都在看同一个项目、各自 read/grep），
+    // 重复劳动的代价远大于多等一会儿。要快就手动切「同时」。
+    return 'sequential';
   }
 
   function renderModePicker() {
@@ -1165,6 +1174,9 @@
         msgsEl.appendChild(el('div', 'daysep', fmtDay(m.at)));
       }
       var node = buildMsg(m);
+      // 动作消息在「不显示动作」时返回 null：跳过，但 seen 已置位，
+      // 所以不会反复重试；打开开关时会整体重绘。
+      if (!node) continue;
       if (sameGroup(prev, m)) node.className += ' tail';
       msgsEl.appendChild(node);
     }
@@ -1202,8 +1214,15 @@
       s.appendChild(el('div', 'bub', m.text));
       return s;
     }
-    // 动作：AI 打算做什么（工具调用轮）。单独一种样式，和正文区分开。
+    // 动作：AI 打算做什么（工具调用轮）。
+    //
+    // 默认**不显示**。原因是它的内容是原始 JS（const g1 = await grep(...)），
+    // 铺在聊天流里既难读又喧宾夺主——用户要的是对话，不是执行日志。
+    //
+    // 但数据必须保留：防撞车靠它解析文件占用，/claims/status 也要用。
+    // 所以这里只是不渲染，想看的时候可以打开「动作」开关。
     if (m.role === 'action') {
+      if (!state.showAction) return null;
       var a = el('div', 'ev act');
       a.setAttribute('data-mid', m.id);
       a.style.setProperty('--id-h', hueOf(m.windowId));
@@ -2443,6 +2462,17 @@
   moreMenu.addEventListener('click', function (e) { e.stopPropagation(); });
 
   miRefresh.addEventListener('click', function () { closeMoreMenu(); refresh(); });
+  // 动作开关：默认关。打开后重绘，把动作补进聊天流。
+  miAction.addEventListener('click', function () {
+    state.showAction = !state.showAction;
+    try { localStorage.setItem(ACTION_KEY, state.showAction ? '1' : '0'); } catch (e) {}
+    actionState.textContent = state.showAction ? '开' : '关';
+    closeMoreMenu();
+    msgsEl.textContent = '';
+    state.seen = {};
+    state.lastCount = 0;
+    refresh();
+  });
   miClear.addEventListener('click', function () {
     closeMoreMenu();
     var t = currentTopic();
@@ -2509,6 +2539,9 @@
   applyTheme('dark');
   state.ctxLimit = loadCtxLimit();
   state.mode = loadMode();
+  // 动作显示开关：默认关，记住上次选择
+  try { state.showAction = localStorage.getItem(ACTION_KEY) === '1'; } catch (e) { state.showAction = false; }
+  if (actionState) actionState.textContent = state.showAction ? '开' : '关';
   // 接力默认关；启动时问一下服务端（可能上次开着）
   setRelay(false);
   pullRelay();

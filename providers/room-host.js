@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.18.0';
+const VERSION = '0.19.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -718,7 +718,9 @@ const chat = {
   // 发言方式：parallel（同时开工，快但互相看不见）
   //          sequential（一个一个来，后者能看到前者）
   // 用户实测过：并行时两个成员会干同一件事，所以要能切到串行。
-  mode: 'parallel',
+  // 默认「排队」：并行时成员会重复劳动（实测两位都在看同一个项目），
+  // 多等一会儿换掉重复干活，更划算。要快可以在界面切「同时」。
+  mode: 'sequential',
 };
 let chatSaveTimer = null;
 
@@ -1067,9 +1069,13 @@ async function chatSend(body) {
     .filter(Boolean);
   if (!targets.length) return { ok: false, error: '没有可用的对话对象（请先打开 AI 窗口）' };
 
-  const mode = body.mode === 'sequential' ? 'sequential' : 'parallel';
-  // 记住用户选过的方式，下次默认沿用
-  if (body.mode === 'sequential' || body.mode === 'parallel') chat.mode = mode;
+  // 请求没指定就用上次记住的（默认 sequential），不要硬退回 parallel——
+  // 否则界面上选了「排队」，只要某个调用忘了带 mode 就会悄悄变回并行。
+  let mode = chat.mode || 'sequential';
+  if (body.mode === 'sequential' || body.mode === 'parallel') {
+    mode = body.mode;
+    chat.mode = mode;
+  }
   // 上下文条数：本次请求 > 配置默认值。0 = 不带上下文。
   // 兼容旧的 withContext:false（等价于 0），避免老调用方行为突变。
   let ctxLimit;
