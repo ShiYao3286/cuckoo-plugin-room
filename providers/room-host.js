@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.14.0';
+const VERSION = '0.14.1';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -352,6 +352,45 @@ function summarizeAction(text) {
   const lines = body.split('\n').map((s) => s.trim()).filter(Boolean);
   const pick = lines.slice(0, 4).join('\n');
   return pick.length > 400 ? (pick.slice(0, 400) + '…') : pick;
+}
+
+/**
+ * 把动作压成**一行**，用于进上下文。
+ *
+ * 为什么不能直接用 summarizeAction 的结果：
+ * 那个是给人看的（保留代码形状），一段就是 60-160 字。
+ * 动作如果进上下文，按最近 14 条算，光动作就能吃掉一千多字，
+ * 而且代码片段会干扰 AI 对"谁做了什么"的理解。
+ *
+ * 这里只留最关键的三样：**动作类型 + 目标**。
+ *   writeFile src/csv.js
+ *   runCommand `npm test`
+ *   readFile a.js + writeFile b.js
+ * 实测体积约为原来的 1/5，信息量够用。
+ */
+function compactAction(text) {
+  const raw = String(text || '');
+  const m = raw.match(/```(?:cuckoo|js)[^\n]*\n([\s\S]*?)```/);
+  const body = m ? m[1] : raw;
+  const calls = [];
+  const re = /tools\.(\w+)\s*\(\s*\{([^}]*)\}/g;
+  let x;
+  while ((x = re.exec(body))) {
+    const fn = x[1];
+    const args = x[2];
+    const p = (args.match(/path\s*:\s*["']([^"']+)["']/) || [])[1];
+    const c = (args.match(/command\s*:\s*["']([^"']+)["']/) || [])[1];
+    if (p) calls.push(fn + ' ' + p);
+    else if (c) calls.push(fn + ' `' + c + '`');
+    else calls.push(fn);
+  }
+  if (!calls.length) {
+    // 认不出 tools.xxx：退回首行前 60 字，至少说明它在做什么
+    const first = body.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
+    return first.slice(0, 60);
+  }
+  const joined = calls.join(' + ');
+  return joined.length > 120 ? (joined.slice(0, 120) + '…') : joined;
 }
 
 /**
@@ -746,14 +785,31 @@ function buildChatContext(limit, excludeId, topicId) {
   ensureTopics();
   const topic = topicId || chat.activeTopic;
 
-  let recent = chat.messages.filter((m) => m.role === 'user' || m.role === 'ai');
-  // 只取同话题。旧消息若没 topic 字段（理论上迁移后不会有），退而当作默认话题
-  recent = recent.filter((m) => (m.topic || chat.topics[0].id) === topic);
-  if (excludeId) recent = recent.filter((m) => m.id !== excludeId);
-  recent = recent.slice(-n);
-  if (!recent.length) return { text: '', count: 0 };
-  const lines = recent.map((m) => (m.role === 'user' ? ('我：' + m.text) : ((m.who || 'AI') + '：' + m.text)));
-  return { text: lines.join('\n'), count: recent.length };
+  // 取最近 N 条（user / ai / action 都算）。
+  // 动作参与计数是刻意的：它本身就是"上一轮发生了什么"的一部分，
+  // 单独排除会导致 AI 只看到回答、看不到回答背后的动作。
+  const inTopic = (m) => (m.topic || chat.topics[0].id) === topic;
+  const picked = chat.messages
+    .filter((m) => m.role === 'user' || m.role === 'ai' || m.role === 'action')
+    .filter(inTopic)
+    .filter((m) => !excludeId || m.id !== excludeId)
+    .slice(-n);
+  if (!picked.length) return { text: '', count: 0 };
+
+  const lines = picked.map((m) => {
+    if (m.role === 'user') return '我：' + m.text;
+    // 动作压成一行，前缀 [动作] 让 AI 一眼看出这是"做了什么"而非"说了什么"。
+    // 不压缩的话，一段动作原文 60-160 字，14 条能吃掉上千字，代码片段还会干扰理解。
+    if (m.role === 'action') {
+      const brief = compactAction(m.actionRaw || m.text || '');
+      return '[' + (m.mention || m.who || '某位') + ' 的动作] ' + brief;
+    }
+    return (m.mention || m.who || 'AI') + '：' + m.text;
+  });
+  // count 只统计"对话条目"，动作不算——界面上的「带 N 条上文」说的是对话，
+  // 把动作算进去会让人以为带了更多对话，反而困惑。
+  const count = picked.filter((m) => m.role !== 'action').length;
+  return { text: lines.join('\n'), count: count };
 }
 
 /**
@@ -765,10 +821,13 @@ function buildChatContext(limit, excludeId, topicId) {
  *
  * 只做展示，不拦截、不审批——这不是权限系统，别指望它防住什么。
  */
-function pushAction(windowId, label, brief, raw) {
+function pushAction(windowId, label, brief, raw, mention) {
   if (!brief) return null;
   return pushMsg({
     role: 'action', who: label, windowId: windowId,
+    // mention 必须一起存：否则上下文里同一人会出现两个名字
+    // （动作那行写标题、正文那行写 mention），AI 会当成两个人。
+    mention: mention || '',
     text: brief, actionRaw: raw || '',
   });
 }
@@ -958,7 +1017,7 @@ async function chatSend(body) {
       const prompt = head + first.prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
-        onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
+        onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw, mentionOf(w.windowId)),
       });
       if (res.ok) {
         streamEnd(w.windowId, res.text);
@@ -1024,7 +1083,7 @@ async function chatSend(body) {
             + '【来自成员 ' + msg.mention + ' 的话】\n' + msg.text;
           const res = await sendAndCapture(wcOf(tw), prompt, cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(tw.windowId, t),
-            onAction: (brief, info) => pushAction(tw.windowId, tw.title || tw.providerId, brief, info && info.raw),
+            onAction: (brief, info) => pushAction(tw.windowId, tw.title || tw.providerId, brief, info && info.raw, h.mention),
           });
           if (res.ok) {
             streamEnd(tw.windowId, res.text);
@@ -1255,7 +1314,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(1, { roster, self: mention, task: text }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
-            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
+            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw, mentionOf(w.windowId)),
             signal: sig,
           });
           if (res.ok) {
@@ -1309,7 +1368,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(2, { roster, self: mention, task: text, proposals }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
-            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
+            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw, mentionOf(w.windowId)),
             signal: sig,
           });
           if (res.ok) {
@@ -2382,6 +2441,8 @@ module.exports.__room = {
   buildQuoteBlock: buildQuoteBlock,
   assignMentions: assignMentions,
   parseMentions: parseMentions,
+  compactAction: compactAction,
+  summarizeAction: summarizeAction,
   buildRelayHeader: buildRelayHeader,
   planPrompt: planPrompt,
   planStart: planStart,
