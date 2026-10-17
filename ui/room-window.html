@@ -267,17 +267,20 @@
   .ev.act .claims .cf{font-size:var(--fs-xs);padding:1px 6px;border-radius:var(--r-sm);
     background:var(--pri-soft);color:var(--pri);font-family:ui-monospace,Consolas,monospace}
 
-  /* 思考过程（默认折叠，只给人看，不进上下文） */
-  .ev .bub .thinkbox{margin-bottom:8px;border:1px solid var(--line-2);border-radius:var(--r-sm);
-    background:var(--code-bg);overflow:hidden}
-  .ev .bub .thinkbox .th{display:flex;align-items:center;gap:6px;padding:5px 10px;
-    cursor:pointer;font-size:var(--fs-sm);color:var(--fg-3);user-select:none}
+  /* 思考过程：向 DeepSeek 的「已思考（用时 N 秒）」靠拢。
+     改造前是有边框的面板，视觉上很重；现在只是一行淡淡的提示，
+     点开才展开，收起时不占地方。 */
+  .ev .bub .thinkbox{margin-bottom:var(--s2);border:none;background:transparent;overflow:visible}
+  .ev .bub .thinkbox .th{display:inline-flex;align-items:center;gap:5px;
+    padding:2px 8px 2px 0;cursor:pointer;font-size:var(--fs-xs);
+    color:var(--fg-3);user-select:none}
   .ev .bub .thinkbox .th:hover{color:var(--fg-2)}
-  .ev .bub .thinkbox .th .ic{font-size:var(--fs-xs);transition:transform .15s}
+  .ev .bub .thinkbox .th .ic{font-size:9px;transition:transform .15s;opacity:.7}
   .ev .bub .thinkbox.open .th .ic{transform:rotate(90deg)}
-  .ev .bub .thinkbox .tb{display:none;padding:0 10px 8px;font-size:var(--fs-sm);line-height:1.65;
-    color:var(--fg-3);white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;
-    font-family:inherit}
+  .ev .bub .thinkbox .tb{display:none;margin:var(--s1) 0 var(--s2);
+    padding:var(--s2) var(--s3);border-left:2px solid var(--line-2);
+    font-size:var(--fs-sm);line-height:1.7;color:var(--fg-3);
+    white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;font-family:inherit}
   .ev .bub .thinkbox.open .tb{display:block}
 
   /* ---------- 消息搜索 ---------- */
@@ -350,15 +353,17 @@
        - 同一人连续说话（.tail）：几乎贴着，形成一组
        - 换人说话：明显拉开
      改造前统一 5px，所有消息糊成一片，看不出哪是一条新消息。 */
-  .ev{display:flex;gap:var(--s3);padding:0;max-width:100%;margin-top:var(--s3)}
+  .ev{display:flex;gap:var(--s3);padding:0;max-width:100%;margin-top:var(--s4)}
   .ev:first-child{margin-top:0}
-  .ev.tail{margin-top:2px}
+  .ev.tail{margin-top:var(--s2)}
   .ev.me{flex-direction:row-reverse}
   .ev .av{width:28px;height:28px;border-radius:var(--r-sm);flex:none;margin-top:2px;
     display:flex;align-items:center;justify-content:center;
     font-size:var(--fs-sm);font-weight:700;color:#fff;
     background:hsl(var(--id-h) var(--id-sat) var(--id-light));user-select:none}
-  .ev .col{min-width:0;max-width:min(var(--bubble-max),78%)}
+  .ev .col{min-width:0;max-width:min(var(--bubble-max),82%)}
+  /* 用户消息有气泡，宽度可以收窄一点；AI 回复没气泡，给足宽度 */
+  .ev.me .col{max-width:min(560px,72%)}
   .ev .hd{display:flex;align-items:baseline;gap:7px;margin-bottom:3px}
   .ev.me .hd{flex-direction:row-reverse}
   .ev .who{font-size:var(--fs-sm);font-weight:600;
@@ -367,11 +372,17 @@
   .ev .tm{font-size:var(--fs-xs);color:var(--fg-3);opacity:0;transition:opacity .15s}
   .ev:hover .tm{opacity:1}
 
-  .ev .bub{background:var(--card);border-radius:var(--r-sm) var(--r-lg) var(--r-lg) var(--r-lg);
-    padding:var(--s2) var(--s3);box-shadow:var(--shadow);
+  /* 气泡
+     向 DeepSeek 的做法靠拢：
+       - AI 回复**不加气泡**，文字直接铺在背景上（阅读时更安静，长回复不闷）
+       - 只有用户自己的消息才有气泡（实色，与其他内容区分开）
+     改造前两类消息都有卡片底 + 阴影，整屏都是方块，显得重。 */
+  .ev .bub{background:transparent;border:none;box-shadow:none;
+    border-radius:0;padding:0;
     overflow-wrap:break-word;word-break:break-word}
   .ev.me .bub{background:var(--self-bg);border:1px solid var(--self-line);
-    border-radius:var(--r-lg) 4px var(--r-lg) var(--r-lg)}
+    border-radius:var(--r-lg) 4px var(--r-lg) var(--r-lg);
+    padding:var(--s2) var(--s3);box-shadow:none}
   /* 连续同一人：收起头像与抬头，视觉上连成一组 */
   .ev.tail .av,.ev.tail .hd{visibility:hidden;height:0;margin:0;overflow:hidden}
   .ev.tail .bub{border-radius:var(--r-lg)}
@@ -407,6 +418,18 @@
   .md strong{font-weight:650}
   .md code{font-family:ui-monospace,"Cascadia Code",Consolas,"Courier New",monospace;font-size:.9em;
     background:var(--code-bg);padding:.12em .38em;border-radius:var(--r-sm)}
+  /* 代码块：带头部栏（语言名 + 复制），向 DeepSeek 的做法靠拢。
+     改造前只是一个带边框的 <pre>，语言和操作都没有落点。 */
+  .md .codebox{background:var(--code-bg);border:1px solid var(--line);
+    border-radius:var(--r-md);margin:.65em 0;overflow:hidden}
+  .md .codebox .cbar{display:flex;align-items:center;gap:var(--s2);
+    padding:5px var(--s3);background:color-mix(in srgb,var(--card-2) 55%,transparent);
+    border-bottom:1px solid var(--line);font-size:var(--fs-xs);color:var(--fg-3)}
+  .md .codebox .cbar .lang{flex:1;font-family:ui-monospace,Consolas,monospace;opacity:.85}
+  .md .codebox .cbar button{padding:0 9px;font-size:var(--fs-xs);border-radius:var(--r-sm);
+    background:transparent;border:1px solid var(--line-2);color:var(--fg-3);line-height:1.7}
+  .md .codebox .cbar button:hover{color:var(--fg);background:var(--hover)}
+  .md .codebox pre{margin:0;border:none;border-radius:0;padding:10px var(--s3);background:transparent}
   .md pre{background:var(--code-bg);border-radius:var(--r-md);padding:10px 12px;overflow:auto;margin:.55em 0;
     border:1px solid var(--line)}
   .md pre code{background:none;padding:0;font-size:var(--fs-sm);line-height:1.55}
@@ -944,8 +967,39 @@
         }
       }
       sanitize(n, e);
-      out.appendChild(e);
+      // 代码块：外面包一层带「语言 + 复制」的头部栏。
+      // 注意必须在这里做（消毒之后），否则按钮会被白名单丢掉。
+      if (tag === 'PRE') {
+        out.appendChild(wrapCodeBox(e, n));
+      } else {
+        out.appendChild(e);
+      }
     }
+  }
+
+  /** 把 <pre> 包成带头部栏的代码块 */
+  function wrapCodeBox(preEl, srcPre) {
+    var box = el('div', 'codebox');
+    var bar = el('div', 'cbar');
+    // marked 会给 <code> 加 class="language-xxx"；取不到就标 fallback
+    var lang = 'text';
+    var codeEl = srcPre && srcPre.querySelector ? srcPre.querySelector('code') : null;
+    if (codeEl && codeEl.className) {
+      var mm = String(codeEl.className).match(/language-([\w+#-]+)/);
+      if (mm) lang = mm[1];
+    }
+    bar.appendChild(el('span', 'lang', lang));
+    var cp = el('button', null, '复制');
+    cp.addEventListener('click', function (e) {
+      e.stopPropagation();
+      // 复制纯代码，不带语言行
+      var raw = preEl.textContent || '';
+      copyText(raw, cp);
+    });
+    bar.appendChild(cp);
+    box.appendChild(bar);
+    box.appendChild(preEl);
+    return box;
   }
 
   function renderMarkdown(text) {
@@ -1383,7 +1437,7 @@
       var tb = el('div', 'thinkbox');
       var th = el('div', 'th');
       th.appendChild(el('span', 'ic', '▶'));
-      th.appendChild(el('span', null, '思考了 ' + m.think.length + ' 字'));
+      th.appendChild(el('span', null, '已思考（' + m.think.length + ' 字）'));
       var tbody = el('div', 'tb', m.think);
       th.addEventListener('click', function (e) {
         e.stopPropagation();
