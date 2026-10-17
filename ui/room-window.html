@@ -203,6 +203,15 @@
   .ev.act .hd .actmore{margin-left:auto;padding:1px 8px;font-size:10.5px;border-radius:5px;
     background:transparent;border-color:var(--line-2);color:var(--fg-3)}
   .ev.act .hd .actmore:hover{color:var(--fg)}
+  /* 动作声明的文件占用 */
+  .ev.act .claims{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+  .ev.act .claims .cf{font-size:10.5px;padding:1px 6px;border-radius:4px;
+    background:var(--pri-soft);color:var(--pri);font-family:ui-monospace,Consolas,monospace}
+  /* 顶栏占用指示 */
+  #claimWrap{display:flex;align-items:center;gap:5px;flex:none;font-size:11.5px;
+    color:var(--fg-3);cursor:pointer}
+  #claimWrap.warn{color:var(--warn)}
+  #claimWrap .n{font-weight:600}
   .ev.act .hd::after{content:'🔧 动作';font-size:10.5px;color:var(--warn);
     border:1px solid var(--warn);border-radius:4px;padding:0 4px;margin-left:auto;opacity:.8}
 
@@ -485,6 +494,9 @@
     <div id="relayWrap" title="开启后：AI 回复里 @ 别人会自动转发给对方（最多 3 跳，防止失控）">
       <div id="relaySw"></div><span>接力</span>
     </div>
+    <div id="claimWrap" title="当前被占用的文件（最近 30 分钟内的写操作）">
+      <span>📄</span><span class="n" id="claimN">0</span>
+    </div>
     <div id="status">正在连接…</div>
     <button id="btn-plan" class="icon" title="分工讨论：让成员各自提案、互相挑错，最后出一张分工表">📋</button>
     <button id="btn-refresh" class="icon" title="刷新">↻</button>
@@ -594,6 +606,7 @@
   var searchBarEl = $('searchBar'), searchInput = $('searchInput'), searchCountEl = $('searchCnt');
   var btnSearch = $('btn-search'), searchPrev = $('searchPrev'), searchNext = $('searchNext'), searchClose = $('searchClose');
   var relayWrap = $('relayWrap'), relaySw = $('relaySw');
+  var claimWrap = $('claimWrap'), claimN = $('claimN');
   var btnPlan = $('btn-plan'), planBar = $('planBar'), planTask = $('planTask');
   var planGo = $('planGo'), planCancel = $('planCancel'), planCost = $('planCost');
   var planProg = $('planProg'), planStageEl = $('planStage'), planBarFill = $('planBarFill');
@@ -667,6 +680,8 @@
     search: { open: false, q: '', hits: [], cur: -1 },
     // 接力开关（默认关：开着跑起来会连发多条，得让人主动选）
     relay: false,
+    // 当前被占用的文件
+    claims: [],
   };
 
   // ===================== 通信 =====================
@@ -1047,6 +1062,16 @@
       acol.appendChild(ahd);
       var abub = el('div', 'bub', m.text || '');
       acol.appendChild(abub);
+      // 这条动作声明占用了哪些文件（写操作才有）
+      if (m.claims && m.claims.length) {
+        var cb = el('div', 'claims');
+        m.claims.forEach(function (p) {
+          var f = el('span', 'cf', p);
+          f.title = '这个文件已被 ' + (m.mention || m.who || '某位') + ' 改动';
+          cb.appendChild(f);
+        });
+        acol.appendChild(cb);
+      }
       // 原始文本比摘要长时，给个"看全文"
       if (m.actionRaw && m.actionRaw.length > (m.text || '').length + 20) {
         var more = el('button', 'actmore', '看全文');
@@ -2000,6 +2025,38 @@
     }, function () { planStopBtn.textContent = '停止'; });
   });
 
+  // ===================== 文件占用（防撞车） =====================
+  /**
+   * 显示当前被占用的文件数。
+   *
+   * 注意：这是**可见性**，不是锁。插件层没有工具执行前的拦截钩子，
+   * 拦不住 AI 去写。它的作用是让用户和 AI 都知道"谁在动什么"，
+   * 冲突时能及时发现并协调。
+   */
+  function pullClaims() {
+    return api('/claims/status').then(function (r) {
+      var n = (r && r.claims && r.claims.length) || 0;
+      claimN.textContent = String(n);
+      claimWrap.className = n > 0 ? 'warn' : '';
+      claimWrap.title = n > 0
+        ? n + ' 个文件最近被改动过（点击看详情，' + (r.ttlMin || 30) + ' 分钟后自动释放）'
+        : '当前没有文件被占用';
+      state.claims = (r && r.claims) || [];
+    }, function () {});
+  }
+
+  claimWrap.addEventListener('click', function () {
+    var cs = state.claims || [];
+    if (!cs.length) { setError('当前没有文件被占用'); return; }
+    askConfirm('当前被改动的文件',
+      cs.map(function (c) {
+        return '· ' + c.path + '\n   被 ' + (c.holders || []).join('、') + ' 动过';
+      }).join('\n\n')
+      + '\n\n这只是提示，不会阻止任何操作。要避免撞车，'
+      + '请在发任务时说明清楚谁负责哪些文件。')
+      .then(function () {});
+  });
+
   // ===================== 状态 =====================
   function renderStatus() {
     var busy = (state.chat.busy || []).length;
@@ -2072,7 +2129,7 @@
     }, function () {});
   }
   function refresh() {
-    return pullStatus().then(pullChat).then(renderAll, renderAll);
+    return pullStatus().then(pullChat).then(pullClaims).then(renderAll, renderAll);
   }
 
   // ===================== 发送 =====================

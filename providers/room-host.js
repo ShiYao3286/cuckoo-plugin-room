@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.14.1';
+const VERSION = '0.15.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -343,6 +343,91 @@ const STREAM_PEEK = '(function(){ var s = window.__ckRoomStream; return s ? { t:
  */
 const ACTION_PEEK = '(function(){ var a = window.__ckRoomAction; return a ? { t: a.t, n: a.n, at: a.at } : null; })();';
 
+/**
+ * 从动作原文里解析出「涉及的文件」，并区分读/写。
+ *
+ * 为什么区分：**只有写才会撞车**。两个 AI 都读同一个文件没关系，
+ * 一起写才会互相覆盖。不区分会给用户一堆没必要的警告。
+ */
+const WRITE_FNS = /^(write|edit|replace|create|delete|remove|move|rename|patch|append)/i;
+
+function parseActionPaths(text) {
+  const raw = String(text || '');
+  const m = raw.match(/```(?:cuckoo|js)[^\n]*\n([\s\S]*?)```/);
+  const body = m ? m[1] : raw;
+  const writes = [];
+  const reads = [];
+  const re = /tools\.(\w+)\s*\(\s*\{([^}]*)\}/g;
+  let x;
+  while ((x = re.exec(body))) {
+    const fn = x[1];
+    const args = x[2];
+    const p = (args.match(/path\s*:\s*["']([^"']+)["']/) || [])[1]
+      || (args.match(/file\s*:\s*["']([^"']+)["']/) || [])[1];
+    if (!p) continue;
+    // 归一化：反斜杠转正斜杠、去掉 ./ 前缀。
+    // 注意 \\+ → / ：Windows 路径经过 JSON 转义后可能留下连续反斜杠，
+    // 只做 replace(/\\/g,'/') 会得到 src//win//f.js（实测踩过）。
+    const norm = p.replace(/\\+/g, '/').replace(/^\.\//, '');
+    if (WRITE_FNS.test(fn)) { if (writes.indexOf(norm) < 0) writes.push(norm); }
+    else if (reads.indexOf(norm) < 0) reads.push(norm);
+  }
+  return { writes: writes, reads: reads };
+}
+
+/**
+ * 当前有哪些文件正被谁占着。
+ *
+ * 只看**当前话题、且 30 分钟内**的写动作。
+ * 不做永久占用——半小时前改过某个文件，不该阻止现在再改。
+ */
+const CLAIM_TTL_MS = 30 * 60 * 1000;
+
+function currentClaims(topicId) {
+  const topic = topicId || chat.activeTopic;
+  const now = Date.now();
+  const claims = {};
+  for (const m of chat.messages) {
+    if (m.role !== 'action') continue;
+    if ((m.topic || chat.topics[0].id) !== topic) continue;
+    if (now - (m.at || 0) > CLAIM_TTL_MS) continue;
+    if (!m.claims || !m.claims.length) continue;
+    for (const p of m.claims) {
+      (claims[p] = claims[p] || []).push({
+        mention: m.mention || m.who || '某位', at: m.at, windowId: m.windowId,
+      });
+    }
+  }
+  return claims;
+}
+
+/**
+ * 给某位成员生成「文件占用提示」。
+ *
+ * 这是**软约束，不是锁**：插件层没有工具执行前的拦截钩子
+ * （Cuckoo 只在各工具内部做 isProtectedPath 检查，插不进去），
+ * 拦不住 AI 真的去写。能做的是把它知会清楚——
+ * 让 AI 自己避开，或主动说明"我要改这个文件"。
+ */
+function buildClaimHint(selfMention, topicId) {
+  const claims = currentClaims(topicId);
+  const others = [];
+  for (const p of Object.keys(claims)) {
+    if (others.length >= 12) break;
+    const holders = claims[p].filter((c) => c.mention !== selfMention);
+    if (holders.length) {
+      const names = [];
+      for (const h of holders) if (names.indexOf(h.mention) < 0) names.push(h.mention);
+      others.push(p + '（' + names.join('、') + ' 最近动过）');
+    }
+  }
+  if (!others.length) return '';
+  return '【文件占用提醒】以下文件最近已被其他人动过：\n'
+    + others.map((x) => '- ' + x).join('\n')
+    + '\n如果你要改这些文件，先说清你要改什么、为什么，或者换个不冲突的做法。'
+    + '不要默默覆盖别人的改动。\n\n';
+}
+
 /** 从工具调用轮原文里抽出一个简短的动作摘要，给界面显示 */
 function summarizeAction(text) {
   const raw = String(text || '');
@@ -430,9 +515,13 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
     let lastN = -1;
     let lastActN = -1;
     (async function peekLoop() {
+      // 先立刻读一次再进定时循环。
+      //
+      // 为什么不能只有 await 定时器：如果 AI 秒回（尤其自动化场景），
+      // capture 会在第一个 250ms 走完之前结束，stopPeekLoop 的
+      // clearTimeout 会让那个 promise 永远不 resolve，整轮 peek 一次都不跑。
+      // 实测复现过：桩同步返回时，动作一次都没被读到。
       while (!stopPeek) {
-        await new Promise((r) => { peekTimer = setTimeout(r, 250); });
-        if (stopPeek) break;
         try {
           if (onProgress) {
             const s = await wc.executeJavaScript(STREAM_PEEK, true);
@@ -451,10 +540,14 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
             }
           }
         } catch (_) { /* 页面可能正在导航，忽略这一轮 */ }
+        if (stopPeek) break;
+        await new Promise((r) => { peekTimer = setTimeout(r, 250); });
       }
     })().catch(() => {});
   }
-  const stopPeekLoop = () => { stopPeek = true; if (peekTimer) clearTimeout(peekTimer); };
+  // 停止时别再 clearTimeout：让定时器自然到期，循环会因 stopPeek 退出。
+  // （clearTimeout 会让等待中的 promise 永远悬着，见上面的注释。）
+  const stopPeekLoop = () => { stopPeek = true; };
 
   // 发送前就被叫停：不必再发
   if (signal && signal.aborted) { stopPeekLoop(); return { ok: false, aborted: true, error: '已取消' }; }
@@ -823,12 +916,15 @@ function buildChatContext(limit, excludeId, topicId) {
  */
 function pushAction(windowId, label, brief, raw, mention) {
   if (!brief) return null;
+  // 记下这条动作声明占用了哪些文件（只记写操作），供后续防撞车判断
+  const parsed = parseActionPaths(raw || brief);
   return pushMsg({
     role: 'action', who: label, windowId: windowId,
     // mention 必须一起存：否则上下文里同一人会出现两个名字
     // （动作那行写标题、正文那行写 mention），AI 会当成两个人。
     mention: mention || '',
     text: brief, actionRaw: raw || '',
+    claims: parsed.writes,
   });
 }
 
@@ -1003,7 +1099,6 @@ async function chatSend(body) {
     const ctx = ctxLimit ? buildChatContext(ctxLimit, userMsg.id, topicId) : { text: '', count: 0 };
     return { prefix: (ctx.text ? (ctx.text + '\n\n---\n') : '') + quoteBlock, count: ctx.count };
   };
-
   const first = buildPrefix();
   // 把"本次带了多少上下文"记在用户消息上，界面据此显示
   userMsg.ctxUsed = first.count;
@@ -1013,7 +1108,9 @@ async function chatSend(body) {
     streamStart(w.windowId, w.title || w.providerId);
     try {
       // 协作说明放在最前：让成员知道自己在房间里、别人叫什么
-      const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn);
+      // 紧接着是文件占用提醒：软约束，让 AI 知道哪些文件别人最近动过
+      const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn)
+        + buildClaimHint(mentionOf(w.windowId), topicId);
       const prompt = head + first.prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
@@ -1076,7 +1173,8 @@ async function chatSend(body) {
         chat.busy[tw.windowId] = true;
         streamStart(tw.windowId, tw.title || tw.providerId);
         try {
-          const head = buildRelayHeader(h.mention, roster, relayOn);
+          const head = buildRelayHeader(h.mention, roster, relayOn)
+            + buildClaimHint(h.mention, topicId);
           const ctx = ctxLimit ? buildChatContext(ctxLimit, null, topicId) : { text: '', count: 0 };
           const prompt = head
             + (ctx.text ? (ctx.text + '\n\n---\n') : '')
@@ -1122,7 +1220,8 @@ async function chatSend(body) {
             // buildPrefix 内部会排除当前这条消息，所以不会重复。
             const now = buildPrefix();
             // 顺序模式也要带协作说明，否则成员不知道可以 @ 别人
-            const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn);
+            const head = buildRelayHeader(mentionOf(w.windowId), roster, relayOn)
+              + buildClaimHint(mentionOf(w.windowId), topicId);
             const prompt = head + now.prefix + text;
             const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
               onProgress: (tx) => streamDelta(w.windowId, tx),
@@ -2098,6 +2197,19 @@ function handle(req, res) {
     return;
   }
 
+  if (p === '/claims/status') {
+    ensureTopics();
+    const claims = currentClaims(chat.activeTopic);
+    const out = [];
+    for (const path of Object.keys(claims)) {
+      const who = [];
+      for (const c of claims[path]) if (who.indexOf(c.mention) < 0) who.push(c.mention);
+      out.push({ path: path, holders: who, at: claims[path][claims[path].length - 1].at });
+    }
+    json(res, 200, { ok: true, claims: out, ttlMin: Math.round(CLAIM_TTL_MS / 60000) });
+    return;
+  }
+
   // ===== 分工讨论 =====
   if (p === '/plan/start' && req.method === 'POST') {
     readBody(req).then((raw) => {
@@ -2441,6 +2553,10 @@ module.exports.__room = {
   buildQuoteBlock: buildQuoteBlock,
   assignMentions: assignMentions,
   parseMentions: parseMentions,
+  parseActionPaths: parseActionPaths,
+  currentClaims: currentClaims,
+  buildClaimHint: buildClaimHint,
+  sendAndCapture: sendAndCapture,
   compactAction: compactAction,
   summarizeAction: summarizeAction,
   buildRelayHeader: buildRelayHeader,
