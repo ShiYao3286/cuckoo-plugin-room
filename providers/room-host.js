@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.11.0';
+const VERSION = '0.11.1';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -450,7 +450,7 @@ async function attachFileToWindow(wc, file) {
  */
 const CHAT_FILE = path.join(USER_DIR, 'cuckoo-room-chat.json');
 const MAX_MESSAGES = 500;
-const chat = { messages: [], seq: 0, busy: {}, sending: false, topics: [], activeTopic: '' };
+const chat = { messages: [], seq: 0, busy: {}, sending: false, topics: [], activeTopic: '', trash: null };
 let chatSaveTimer = null;
 
 /**
@@ -566,6 +566,7 @@ function loadChat() {
       // 话题列表也持久化，否则重启后话题会丢
       if (Array.isArray(raw.topics)) chat.topics = raw.topics;
       if (typeof raw.activeTopic === 'string') chat.activeTopic = raw.activeTopic;
+      if (raw.trash && Array.isArray(raw.trash.messages)) chat.trash = raw.trash;
       log('已载入聊天记录 ' + chat.messages.length + ' 条（seq=' + chat.seq + '）');
     }
   } catch (e) { log('读聊天记录失败:', e && e.message); }
@@ -583,6 +584,8 @@ function saveChatSoon() {
         seq: chat.seq,
         topics: chat.topics,
         activeTopic: chat.activeTopic,
+        // 回收站也落盘：进程重启后仍能撤回上一次清空
+        trash: chat.trash,
         messages: chat.messages.slice(-MAX_MESSAGES),
       }, null, 0), 'utf-8');
     } catch (e) { log('写聊天记录失败:', e && e.message); }
@@ -1373,24 +1376,70 @@ function handle(req, res) {
   }
 
   // 清空：只清当前话题的消息（有了话题隔离后，清空全部会误伤其它话题）。
-  // 传 all:true 才清全部。
+  //
+  // 这个接口曾经毫无防护——任何请求到达就清空且不可恢复。
+  // 实测中一次误调用就把整段记录抹掉了（只剩 seq 和一个空壳文件）。
+  // 现在三道防线：
+  //   1. 必须显式带 confirm:true，否则拒绝；
+  //   2. 清空前把被删的消息存进「回收站」，可用 /chat/restore 取回；
+  //   3. 响应里明确告知 backup 条数，界面据此提示"可撤回"。
   if (p === '/chat/clear' && req.method === 'POST') {
     readBody(req).then((raw) => {
       let body = {};
       try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
       ensureTopics();
-      if (body && body.all === true) {
-        const n = chat.messages.length;
-        chat.messages = [];
-        saveChatSoon();
-        json(res, 200, { ok: true, cleared: n, scope: 'all' });
+
+      if (!body || body.confirm !== true) {
+        json(res, 400, {
+          ok: false,
+          error: '清空需要显式确认（body 里带 confirm:true）',
+          hint: '这是防误触用的：该操作曾因一次误调用抹掉整段记录',
+        });
         return;
       }
-      const before = chat.messages.length;
-      chat.messages = chat.messages.filter((m) => m.topic !== chat.activeTopic);
+
+      const scopeAll = body.all === true;
+      const removed = scopeAll
+        ? chat.messages.slice()
+        : chat.messages.filter((m) => m.topic === chat.activeTopic);
+
+      // 回收站：只留最近一次清空，够撤回就行
+      chat.trash = { at: Date.now(), scope: scopeAll ? 'all' : 'topic', messages: removed };
+
+      if (scopeAll) chat.messages = [];
+      else chat.messages = chat.messages.filter((m) => m.topic !== chat.activeTopic);
+
       saveChatSoon();
-      json(res, 200, { ok: true, cleared: before - chat.messages.length, scope: 'topic' });
-    }).catch(() => json(res, 200, { ok: true, scope: 'topic' }));
+      log('清空 ' + (scopeAll ? '全部' : '话题 ' + chat.activeTopic) + ' 的 ' + removed.length + ' 条消息（已存入回收站）');
+      json(res, 200, {
+        ok: true, cleared: removed.length, scope: scopeAll ? 'all' : 'topic',
+        backup: removed.length, restorable: removed.length > 0,
+      });
+    }).catch(() => json(res, 400, { ok: false, error: '清空需要显式确认' }));
+    return;
+  }
+
+  // 撤回上一次清空
+  if (p === '/chat/restore' && req.method === 'POST') {
+    const t = chat.trash;
+    if (!t || !Array.isArray(t.messages) || !t.messages.length) {
+      json(res, 200, { ok: false, error: '没有可恢复的内容' });
+      return;
+    }
+    // 恢复时按 id 去重，避免与现有消息重复
+    const have = new Set(chat.messages.map((m) => m.id));
+    let added = 0;
+    for (const m of t.messages) {
+      if (have.has(m.id)) continue;
+      chat.messages.push(m);
+      have.add(m.id);
+      added++;
+    }
+    chat.messages.sort((a, b) => (a.at || 0) - (b.at || 0));
+    chat.trash = null;
+    saveChatSoon();
+    log('已恢复 ' + added + ' 条消息');
+    json(res, 200, { ok: true, restored: added });
     return;
   }
 

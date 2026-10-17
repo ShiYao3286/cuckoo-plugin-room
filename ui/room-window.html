@@ -166,6 +166,16 @@
   mark.hl{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;
     border-radius:2px;padding:0 1px}
 
+  /* 清空后的撤回条 */
+  .undo{position:fixed;left:50%;bottom:70px;transform:translateX(-50%);z-index:9000;
+    display:flex;align-items:center;gap:10px;padding:8px 12px 8px 16px;
+    background:var(--card);border:1px solid var(--line-2);border-radius:999px;
+    box-shadow:var(--shadow-lg);font-size:12.5px;color:var(--fg)}
+  .undo button{padding:3px 12px;font-size:12px;border-radius:999px;
+    background:var(--pri-soft);border-color:var(--pri);color:var(--pri)}
+  .undo .x{cursor:pointer;color:var(--fg-3);font-size:13px;padding:0 2px}
+  .undo .x:hover{color:var(--fg)}
+
   /* ---------- 错误横幅 ---------- */
   #banner{display:none;align-items:flex-start;gap:9px;padding:9px 14px;background:var(--err-bg);
     border-bottom:1px solid var(--err-line);color:var(--err);font-size:12.5px;flex:none}
@@ -1112,7 +1122,16 @@
           });
           renderAtts();
         };
-        fr.onerror = function () { setError('读取「' + f.name + '」失败'); renderStatus(); };
+        fr.onerror = function () {
+          // FileReader 失败常见于：文件在读取前被移走/删除、路径不可访问、
+          // 或拖进来的是虚拟文件（如从压缩包里直接拖）。把原因说清楚，别只报"失败"。
+          var why = '';
+          try { why = (fr.error && fr.error.name) ? fr.error.name : ''; } catch (e) {}
+          setError('读取「' + f.name + '」失败'
+            + (why ? '（' + why + '）' : '')
+            + '：文件可能已被移动或删除，或该位置不允许读取。可以改用 📎 按钮重新选择。');
+          renderStatus();
+        };
         fr.readAsDataURL(f);
       })(arr[i]);
     }
@@ -1914,16 +1933,62 @@
     var t = currentTopic();
     // 有了话题隔离后，清空只清当前话题 —— 清全部会误伤其它话题，太危险。
     askConfirm('清空当前话题',
-      '「' + (t ? t.title : '默认') + '」的消息会被清空，其它话题不受影响。此操作不可恢复。')
+      '「' + (t ? t.title : '默认') + '」的消息会被清空，其它话题不受影响。\n'
+      + '清空后 20 秒内可以点状态栏的「撤回」恢复。')
       .then(function (ok) {
         if (!ok) return;
-        return api('/chat/clear', { method: 'POST', body: { topic: state.activeTopic } }).then(function () {
+        return api('/chat/clear', {
+          method: 'POST',
+          body: { topic: state.activeTopic, confirm: true },
+        }).then(function (r) {
           msgsEl.textContent = '';
           state.lastCount = 0;
+          // 服务端把删掉的消息存进了回收站，这里给一个可撤回的窗口
+          if (r && r.restorable) offerUndo(r.cleared);
           return refresh();
         }, function () { refresh(); });
       });
   });
+
+  /**
+   * 清空后的撤回提示。
+   *
+   * 为什么需要：清空是不可逆的破坏性操作，而它曾经毫无防护
+   * （任何请求一到达就执行）。现在服务端会留回收站，
+   * 这里给 20 秒窗口让人反悔。
+   */
+  var undoMsg = null;
+  function offerUndo(n) {
+    if (undoMsg) { try { undoMsg.remove(); } catch (e) {} undoMsg = null; }
+    var bar = el('div', 'undo');
+    bar.appendChild(el('span', null, '已清空 ' + n + ' 条消息'));
+    var b = el('button', null, '撤回');
+    b.addEventListener('click', function () {
+      api('/chat/restore', { method: 'POST' }).then(function (r) {
+        if (r && r.ok) {
+          msgsEl.textContent = '';
+          state.lastCount = 0;
+          setError('');
+        } else {
+          setError('撤回失败：' + ((r && r.error) || '没有可恢复的内容'));
+        }
+        clearUndo();
+        return refresh();
+      }, function () {});
+    });
+    var x = el('span', 'x', '✕');
+    x.addEventListener('click', clearUndo);
+    bar.appendChild(b);
+    bar.appendChild(x);
+    document.body.appendChild(bar);
+    undoMsg = bar;
+    setTimeout(clearUndo, 20000);
+  }
+  function clearUndo() {
+    if (!undoMsg) return;
+    try { undoMsg.remove(); } catch (e) {}
+    undoMsg = null;
+  }
 
   // ===================== 轮询 =====================
   applyTheme('dark');
