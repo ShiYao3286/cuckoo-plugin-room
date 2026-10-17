@@ -107,20 +107,64 @@
   #topicBtn:hover{background:var(--hover)}
   #topicBtn .tn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #topicBtn .tc{color:var(--fg-3);font-size:9px;flex:none}
-  #topicMenu{position:absolute;right:0;top:100%;margin-top:6px;min-width:220px;max-height:320px;overflow:auto;
-    background:var(--card);border:1px solid var(--line-2);border-radius:var(--radius);box-shadow:var(--shadow-lg);
-    display:none;z-index:30;padding:4px}
+
+  /* 菜单用 position:fixed + JS 定位。
+     为什么不用 absolute：它挂在 header 里，会被祖先的层叠上下文与后续元素遮挡，
+     实测出现过只露出一条、点不到的情况。fixed 直接相对视口，不受祖先影响。 */
+  #topicMenu{position:fixed;min-width:240px;max-width:320px;max-height:360px;overflow:auto;
+    background:var(--card);border:1px solid var(--line-2);border-radius:var(--radius);
+    box-shadow:var(--shadow-lg);display:none;z-index:9999;padding:5px}
   #topicMenu.show{display:block}
-  #topicMenu .ti{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:6px;cursor:pointer;font-size:12.5px}
+  #topicMenu .ti{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:6px;
+    cursor:pointer;font-size:12.5px}
   #topicMenu .ti:hover{background:var(--hover)}
   #topicMenu .ti.act{background:var(--pri-soft);color:var(--pri)}
   #topicMenu .ti .tn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #topicMenu .ti .cnt{color:var(--fg-3);font-size:10.5px;flex:none}
-  #topicMenu .ti .del{color:var(--fg-3);font-size:12px;flex:none;padding:0 3px;border-radius:4px}
-  #topicMenu .ti .del:hover{color:var(--err);background:var(--card-2)}
+  #topicMenu .ti .mini{color:var(--fg-3);font-size:12px;flex:none;padding:0 3px;border-radius:4px;opacity:0}
+  #topicMenu .ti:hover .mini{opacity:1}
+  #topicMenu .ti .mini:hover{color:var(--pri);background:var(--card-2)}
+  #topicMenu .ti .del:hover{color:var(--err)}
   #topicMenu .sep{height:1px;background:var(--line);margin:4px 2px}
   #topicMenu .new{padding:6px 9px;border-radius:6px;cursor:pointer;font-size:12.5px;color:var(--pri)}
   #topicMenu .new:hover{background:var(--pri-soft)}
+
+  /* 通用确认框（替代 confirm：Electron 里虽然可用，但样式是系统的，
+     与整体界面不搭；这个还能显示多行与危险色） */
+  #cfmMask{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;
+    align-items:center;justify-content:center;z-index:10000;padding:24px}
+  #cfmMask.show{display:flex}
+  #cfmBox{background:var(--card);border:1px solid var(--line-2);border-radius:var(--radius);
+    box-shadow:var(--shadow-lg);max-width:400px;width:100%;padding:16px 18px}
+  #cfmBox .ct{font-size:13.5px;font-weight:600;margin-bottom:8px}
+  #cfmBox .cm{font-size:12.5px;color:var(--fg-2);line-height:1.65;white-space:pre-wrap;margin-bottom:14px}
+  #cfmBox .cb{display:flex;gap:8px;justify-content:flex-end}
+  #cfmBox .cb button{padding:6px 16px;font-size:12.5px}
+  #cfmBox .cb .ok{background:var(--err);border-color:var(--err);color:#fff}
+  #cfmBox .cb .ok:hover{filter:brightness(1.08)}
+
+  /* 内联输入：Electron 不支持 window.prompt()，
+     所以新建/重命名话题都用这条内联输入行，不弹系统框。 */
+  #topicMenu .inline{display:flex;gap:5px;padding:4px 3px}
+  #topicMenu .inline input{flex:1;min-width:0;background:var(--card-2);color:var(--fg);
+    border:1px solid var(--pri);border-radius:6px;padding:4px 8px;font:inherit;font-size:12.5px;outline:none}
+  #topicMenu .inline button{padding:4px 10px;font-size:12px;border-radius:6px}
+  #topicMenu .hint{padding:6px 9px;color:var(--fg-3);font-size:10.5px;line-height:1.5}
+
+  /* ---------- 消息搜索 ---------- */
+  #searchBar{display:none;align-items:center;gap:7px;padding:7px 14px;background:var(--chrome);
+    border-bottom:1px solid var(--line);flex:none}
+  #searchBar.show{display:flex}
+  #searchBar input{flex:1;background:var(--card);color:var(--fg);border:1px solid var(--line-2);
+    border-radius:7px;padding:5px 10px;font:inherit;font-size:12.5px;outline:none}
+  #searchBar input:focus{border-color:var(--pri)}
+  #searchBar .cnt{color:var(--fg-3);font-size:11px;flex:none;min-width:64px;text-align:right}
+  #searchBar button{padding:4px 9px;font-size:12px}
+  /* 命中的消息：加一圈提示色，当前选中的更亮 */
+  .ev.hit .bub{box-shadow:0 0 0 2px color-mix(in srgb,var(--warn) 55%,transparent)}
+  .ev.hit-cur .bub{box-shadow:0 0 0 2px var(--warn)}
+  mark.hl{background:color-mix(in srgb,var(--warn) 45%,transparent);color:inherit;
+    border-radius:2px;padding:0 1px}
 
   /* ---------- 错误横幅 ---------- */
   #banner{display:none;align-items:flex-start;gap:9px;padding:9px 14px;background:var(--err-bg);
@@ -370,14 +414,37 @@
         <span class="tn" id="topicName">默认</span>
         <span class="tc">▼</span>
       </div>
-      <div id="topicMenu"></div>
     </div>
     <span class="sp"></span>
     <div id="sse" class="off" title="流式输出连接状态"><i></i><span id="sse-txt">连接中</span></div>
     <div id="status">正在连接…</div>
     <button id="btn-refresh" class="icon" title="刷新">↻</button>
-    <button id="btn-clear" class="icon" title="清空聊天记录">🗑</button>
+    <button id="btn-search" class="icon" title="搜索消息（Ctrl+F）">🔍</button>
+    <button id="btn-clear" class="icon" title="清空当前话题">🗑</button>
   </header>
+
+  <div id="searchBar">
+    <input type="text" id="searchInput" placeholder="搜索本话题的消息…（Enter 下一个，Esc 关闭）">
+    <span class="cnt" id="searchCnt"></span>
+    <button id="searchPrev" title="上一个（Shift+Enter）">↑</button>
+    <button id="searchNext" title="下一个（Enter）">↓</button>
+    <button id="searchClose" title="关闭（Esc）">✕</button>
+  </div>
+
+  <!-- 话题菜单放在 body 直下，不放在 header 里：
+       header 是横向 flex 且有固定高度，绝对/固定定位的菜单容易被裁切或遮挡。 -->
+  <div id="topicMenu"></div>
+
+  <div id="cfmMask">
+    <div id="cfmBox">
+      <div class="ct" id="cfmTitle">确认</div>
+      <div class="cm" id="cfmMsg"></div>
+      <div class="cb">
+        <button id="cfmNo">取消</button>
+        <button id="cfmYes" class="ok">确定</button>
+      </div>
+    </div>
+  </div>
 
   <div id="peers"><span class="lbl">参与者</span></div>
 
@@ -437,6 +504,33 @@
   var sseEl = $('sse'), sseTxt = $('sse-txt');
   var quoteBar = $('quoteBar'), quoteWho = $('quoteWho'), quoteText = $('quoteText'), quoteX = $('quoteX');
   var topicWrap = $('topicWrap'), topicBtn = $('topicBtn'), topicMenu = $('topicMenu'), topicNameEl = $('topicName');
+  var cfmMask = $('cfmMask'), cfmTitle = $('cfmTitle'), cfmMsg = $('cfmMsg'), cfmYes = $('cfmYes'), cfmNo = $('cfmNo');
+  var searchBarEl = $('searchBar'), searchInput = $('searchInput'), searchCountEl = $('searchCnt');
+  var btnSearch = $('btn-search'), searchPrev = $('searchPrev'), searchNext = $('searchNext'), searchClose = $('searchClose');
+
+  /**
+   * 危险操作确认。返回 Promise<boolean>。
+   * 替代 window.confirm：Electron 里虽可用，但样式是系统的，与界面不搭；
+   * 而且它阻塞渲染进程，这里用异步框更合适。
+   */
+  var cfmResolve = null;
+  function askConfirm(title, message) {
+    cfmTitle.textContent = title || '确认';
+    cfmMsg.textContent = message || '';
+    cfmMask.className = 'show';
+    return new Promise(function (resolve) {
+      cfmResolve = function (v) { cfmMask.className = ''; cfmResolve = null; resolve(v); };
+      try { cfmNo.focus(); } catch (e) {}
+    });
+  }
+  cfmYes.addEventListener('click', function () { if (cfmResolve) cfmResolve(true); });
+  cfmNo.addEventListener('click', function () { if (cfmResolve) cfmResolve(false); });
+  cfmMask.addEventListener('click', function (e) { if (e.target === cfmMask && cfmResolve) cfmResolve(false); });
+  document.addEventListener('keydown', function (e) {
+    if (!cfmResolve) return;
+    if (e.key === 'Escape') { e.preventDefault(); cfmResolve(false); }
+    if (e.key === 'Enter') { e.preventDefault(); cfmResolve(true); }
+  });
 
   function setError(msg) {
     state.error = msg || '';
@@ -478,6 +572,8 @@
     // 话题（会话隔离）
     topics: [],
     activeTopic: '',
+    // 搜索
+    search: { open: false, q: '', hits: [], cur: -1 },
   };
 
   // ===================== 通信 =====================
@@ -1341,33 +1437,103 @@
       var row = el('div', 'ti' + (t.id === state.activeTopic ? ' act' : ''));
       row.appendChild(el('span', 'tn', t.title));
       var n = all.filter(function (m) { return m.topic === t.id; }).length;
-      row.appendChild(el('span', 'cnt', String(n)));
+      row.appendChild(el('span', 'cnt', n ? String(n) : ''));
       row.addEventListener('click', function (e) {
-        if (e.target && e.target.className === 'del') return;
+        if (e.target && e.target.className && e.target.className.indexOf('mini') >= 0) return;
         switchTopic(t.id);
       });
+
+      // 重命名：就地换成输入行，不用 prompt（Electron 不支持）
+      var ren = el('span', 'mini', '✎');
+      ren.title = '重命名';
+      ren.addEventListener('click', function (e) {
+        e.stopPropagation();
+        showInlineInput('重命名话题', t.title, function (val) {
+          api('/topic/rename', { method: 'POST', body: { id: t.id, title: val } })
+            .then(applyTopicState).then(function () { renderTopicMenu(); }, function () {});
+        });
+      });
+      row.appendChild(ren);
+
       if (state.topics.length > 1) {
-        var del = el('span', 'del', '✕');
+        var del = el('span', 'mini del', '✕');
         del.title = '删除这个话题（连同它的 ' + n + ' 条消息）';
         del.addEventListener('click', function (e) {
           e.stopPropagation();
-          if (!confirm('删除话题「' + t.title + '」？\n\n它下面的 ' + n + ' 条消息会一起删掉，不可恢复。')) return;
-          api('/topic/delete', { method: 'POST', body: { id: t.id } })
-            .then(applyTopicState).then(function () { closeTopicMenu(); return refresh(); }, function () {});
+          askConfirm('删除话题',
+            '「' + t.title + '」下的 ' + n + ' 条消息会一起删掉，不可恢复。')
+            .then(function (ok) {
+              if (!ok) return;
+              return api('/topic/delete', { method: 'POST', body: { id: t.id } })
+                .then(applyTopicState).then(function () {
+                  closeTopicMenu();
+                  msgsEl.textContent = '';
+                  state.lastCount = 0;
+                  return refresh();
+                }, function () {});
+            });
         });
         row.appendChild(del);
       }
       topicMenu.appendChild(row);
     });
+
     topicMenu.appendChild(el('div', 'sep'));
     var add = el('div', 'new', '＋ 新建话题');
     add.addEventListener('click', function () {
-      var title = prompt('新话题的名称：', '话题 ' + (state.topics.length + 1));
-      if (title == null) return;
-      api('/topic/create', { method: 'POST', body: { title: title } })
-        .then(applyTopicState).then(function () { closeTopicMenu(); return refresh(); }, function () {});
+      showInlineInput('新话题名称', '话题 ' + (state.topics.length + 1), function (val) {
+        api('/topic/create', { method: 'POST', body: { title: val } })
+          .then(applyTopicState).then(function () {
+            closeTopicMenu();
+            msgsEl.textContent = '';
+            state.lastCount = 0;
+            return refresh();
+          }, function () {});
+      });
     });
     topicMenu.appendChild(add);
+  }
+
+  /**
+   * 在菜单里就地显示一行输入，替代 window.prompt。
+   *
+   * 为什么必须替代：Electron 的渲染进程**禁用了 window.prompt**
+   * （调用会抛 "prompt() is and will not be supported"），
+   * 所以原来点「新建话题」根本不会有任何反应。
+   */
+  function showInlineInput(placeholder, value, onOk) {
+    var old = topicMenu.querySelector('.inline');
+    if (old) old.remove();
+    var box = el('div', 'inline');
+    var inp = el('input');
+    inp.type = 'text';
+    inp.placeholder = placeholder;
+    inp.value = value || '';
+    var ok = el('button', 'pri', '确定');
+    var submit = function () {
+      var v = String(inp.value || '').trim();
+      if (!v) { try { inp.focus(); } catch (e) {} return; }
+      onOk(v);
+    };
+    ok.addEventListener('click', function (e) { e.stopPropagation(); submit(); });
+    inp.addEventListener('click', function (e) { e.stopPropagation(); });
+    inp.addEventListener('keydown', function (e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      if (e.key === 'Escape') { e.preventDefault(); box.remove(); }
+    });
+    box.appendChild(inp);
+    box.appendChild(ok);
+    topicMenu.insertBefore(box, topicBtnMarker());
+    try { inp.focus(); inp.select(); } catch (e) {}
+  }
+  /** 输入行插到「新建」之前：找那个 new 节点当锚 */
+  function topicBtnMarker() {
+    var kids = topicMenu.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].className === 'new') return kids[i];
+    }
+    return null;
   }
 
   /** 把接口返回的话题状态写进本地 */
@@ -1385,20 +1551,182 @@
       // 换话题等于换一屏内容：清掉已渲染标记并重绘
       msgsEl.textContent = '';
       state.lastCount = 0;
+      // 搜索结果是针对上一话题的，必须清掉，否则会指向已不在 DOM 的节点
+      closeSearch();
       return refresh();
     }, function () {});
   }
 
   function closeTopicMenu() { topicMenu.className = ''; }
 
+  /** 把 fixed 定位的菜单对齐到按钮下方（不出屏、不被裁切） */
+  function positionTopicMenu() {
+    var r = topicBtn.getBoundingClientRect();
+    var vw = window.innerWidth || 1200;
+    var vh = window.innerHeight || 800;
+    var w = topicMenu.offsetWidth || 240;
+    var h = topicMenu.offsetHeight || 200;
+    // 左对齐按钮，但别超出右边界
+    var left = r.left;
+    if (left + w > vw - 8) left = Math.max(8, vw - w - 8);
+    var top = r.bottom + 6;
+    // 下面放不下就翻到上面
+    if (top + h > vh - 8) top = Math.max(8, r.top - h - 6);
+    topicMenu.style.left = Math.round(left) + 'px';
+    topicMenu.style.top = Math.round(top) + 'px';
+  }
+
   topicBtn.addEventListener('click', function (e) {
     e.stopPropagation();
     if (topicMenu.className.indexOf('show') >= 0) { closeTopicMenu(); return; }
     renderTopicMenu();
     topicMenu.className = 'show';
+    positionTopicMenu();
   });
   document.addEventListener('click', function () { closeTopicMenu(); });
   topicMenu.addEventListener('click', function (e) { e.stopPropagation(); });
+  // 窗口尺寸变化时菜单会错位，直接收起（重新打开会重新定位）
+  window.addEventListener('resize', function () { closeTopicMenu(); });
+
+  // ===================== 消息搜索 =====================
+  /**
+   * 只搜当前话题。跨话题搜会把别的议题混进来，反而更难找。
+   * 命中用两类标记：hit（候选）与 hit-cur（当前定位），配合 ↑↓ 循环跳。
+   */
+  function openSearch() {
+    state.search.open = true;
+    searchBarEl.className = 'show';
+    try { searchInput.focus(); searchInput.select(); } catch (e) {}
+    runSearch(state.search.q);
+  }
+
+  function closeSearch() {
+    state.search.open = false;
+    searchBarEl.className = '';
+    state.search.hits = [];
+    state.search.cur = -1;
+    clearMarks();
+    renderSearchCount();
+  }
+
+  function clearMarks() {
+    var kids = Array.prototype.slice.call(msgsEl.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      var n = kids[i];
+      if (!n.className) continue;
+      n.className = n.className.replace(/\s*(hit|hit-cur)\b/g, '');
+      // 还原被高亮的文本
+      var marks = [];
+      (function w(x) {
+        for (var j = 0; j < (x.children || []).length; j++) {
+          var c = x.children[j];
+          if (c.tagName === 'MARK') marks.push(c); else w(c);
+        }
+      })(n);
+      for (var k = 0; k < marks.length; k++) {
+        var m = marks[k];
+        if (m.parentNode) {
+          var txt = document.createTextNode(m.textContent || '');
+          m.parentNode.replaceChild(txt, m);
+        }
+      }
+    }
+  }
+
+  /** 在元素子树里把匹配文本包成 <mark>（不碰已在 mark 里的） */
+  function highlightIn(root, q) {
+    if (!q) return;
+    var lower = q.toLowerCase();
+    var kids = Array.prototype.slice.call(root.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      var c = kids[i];
+      if (c.tagName === 'MARK') continue;
+      if (c.children && c.children.length) { highlightIn(c, q); continue; }
+      var t = c.textContent || '';
+      var idx = t.toLowerCase().indexOf(lower);
+      if (idx < 0) continue;
+      // 只处理第一个匹配，避免在循环里改结构
+      var frag = document.createDocumentFragment();
+      if (idx > 0) frag.appendChild(document.createTextNode(t.slice(0, idx)));
+      var mk = document.createElement('mark');
+      mk.className = 'hl';
+      mk.textContent = t.substr(idx, q.length);
+      frag.appendChild(mk);
+      if (idx + q.length < t.length) frag.appendChild(document.createTextNode(t.slice(idx + q.length)));
+      c.textContent = '';
+      c.appendChild(frag);
+    }
+  }
+
+  function runSearch(q) {
+    state.search.q = q || '';
+    clearMarks();
+    state.search.hits = [];
+    state.search.cur = -1;
+    if (!state.search.q) { renderSearchCount(); return; }
+
+    var kw = state.search.q.toLowerCase();
+    // 只搜当前话题的、可见的消息节点
+    var kids = Array.prototype.slice.call(msgsEl.children || []);
+    for (var i = 0; i < kids.length; i++) {
+      var n = kids[i];
+      if (!n.getAttribute || !n.getAttribute('data-mid')) continue;
+      var text = (n.textContent || '').toLowerCase();
+      if (text.indexOf(kw) < 0) continue;
+      state.search.hits.push(n);
+      n.className = n.className + ' hit';
+      highlightIn(n, state.search.q);
+    }
+    if (state.search.hits.length) {
+      state.search.cur = 0;
+      focusHit(0);
+    }
+    renderSearchCount();
+  }
+
+  function focusHit(i) {
+    var hits = state.search.hits;
+    if (!hits.length) return;
+    var idx = ((i % hits.length) + hits.length) % hits.length;
+    state.search.cur = idx;
+    for (var k = 0; k < hits.length; k++) {
+      hits[k].className = hits[k].className.replace(/\s*hit-cur\b/g, '');
+    }
+    var node = hits[idx];
+    node.className = node.className + ' hit-cur';
+    try { node.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {
+      try { msgsEl.scrollTop = Math.max(0, node.offsetTop - 100); } catch (e2) {}
+    }
+    renderSearchCount();
+  }
+
+  function renderSearchCount() {
+    var n = state.search.hits.length;
+    if (!state.search.q) { searchCountEl.textContent = ''; return; }
+    searchCountEl.textContent = n ? ((state.search.cur + 1) + ' / ' + n) : '无匹配';
+  }
+
+  btnSearch.addEventListener('click', function () {
+    if (state.search.open) closeSearch(); else openSearch();
+  });
+  searchClose.addEventListener('click', closeSearch);
+  searchInput.addEventListener('input', function () { runSearch(searchInput.value.trim()); });
+  searchInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) focusHit(state.search.cur - 1); else focusHit(state.search.cur + 1);
+    }
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+  });
+  searchNext.addEventListener('click', function () { focusHit(state.search.cur + 1); });
+  searchPrev.addEventListener('click', function () { focusHit(state.search.cur - 1); });
+  // 全局快捷键：Ctrl+F 打开搜索
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+      e.preventDefault();
+      openSearch();
+    }
+  });
 
   // ===================== 状态 =====================
   function renderStatus() {
@@ -1585,15 +1913,16 @@
   btnClear.addEventListener('click', function () {
     var t = currentTopic();
     // 有了话题隔离后，清空只清当前话题 —— 清全部会误伤其它话题，太危险。
-    // 想全清就逐个删话题，或者手工删记录文件。
-    var msg = '清空当前话题「' + (t ? t.title : '默认') + '」的消息？\n\n'
-      + '其它话题不受影响。此操作不可恢复。';
-    if (!confirm(msg)) return;
-    api('/chat/clear', { method: 'POST', body: { topic: state.activeTopic } }).then(function () {
-      msgsEl.textContent = '';
-      state.lastCount = 0;
-      return refresh();
-    }, function () { refresh(); });
+    askConfirm('清空当前话题',
+      '「' + (t ? t.title : '默认') + '」的消息会被清空，其它话题不受影响。此操作不可恢复。')
+      .then(function (ok) {
+        if (!ok) return;
+        return api('/chat/clear', { method: 'POST', body: { topic: state.activeTopic } }).then(function () {
+          msgsEl.textContent = '';
+          state.lastCount = 0;
+          return refresh();
+        }, function () { refresh(); });
+      });
   });
 
   // ===================== 轮询 =====================
