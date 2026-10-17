@@ -495,7 +495,11 @@
 
   /* ---------- 输入区（chrome + 卡片） ---------- */
   #composer{flex:none;background:var(--chrome);border-top:1px solid var(--line);padding:10px 14px 11px;position:relative}
-  #sendTo{font-size:var(--fs-xs);color:var(--fg-3);margin-bottom:7px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  /* 「发送给」区：目标一行，设置一行。
+     改造前全挤在一行（目标 + 上下文 + 方式），三类语义混在一起看不出层次，
+     而且每次 tick 都整块重建，点选择器会被冲掉。 */
+  #sendTo{font-size:var(--fs-xs);color:var(--fg-3);margin-bottom:7px;
+    display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:18px}
   #sendTo .tg{cursor:pointer;background:var(--card);border:1px solid var(--line-2);border-radius:999px;
     padding:1px 9px;color:var(--fg-2);transition:.12s}
   #sendTo .tg:hover{color:var(--err);border-color:var(--err-line)}
@@ -640,6 +644,7 @@
   <div id="composer">
     <div id="mention"></div>
     <div id="sendTo"></div>
+    <div id="opts"></div>
     <div id="planProg">
       <span class="stg" id="planStage">准备中</span>
       <div class="bar"><i id="planBarFill" style="width:0%"></i></div>
@@ -693,6 +698,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var dot = $('dot'), statusEl = $('status'), peersEl = $('peers'), msgsEl = $('msgs');
   var attsEl = $('atts'), inputEl = $('input'), sendToEl = $('sendTo'), mentionEl = $('mention');
+  var optsEl = $('opts');
   var btnSend = $('btn-send'), btnAttach = $('btn-attach');
   var filePick = $('filePick'), dropEl = $('drop'), footEl = $('foot');
   var bannerEl = $('banner'), bannerTxt = $('banner-txt'), bannerX = $('banner-x');
@@ -820,6 +826,21 @@
       var d = new Date(t);
       return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
     } catch (e) { return ''; }
+  }
+  /**
+   * 只取日期串（用于判断是否跨天），带缓存。
+   * 原来在渲染循环里对每条消息 new Date() 两次，条数多了是白白的开销。
+   */
+  var _dateCache = {};
+  var _dateCacheN = 0;
+  function dateStr(t) {
+    var key = String(t);
+    if (_dateCache[key] !== undefined) return _dateCache[key];
+    var s = '';
+    try { s = new Date(t).toDateString(); } catch (e) { s = ''; }
+    if (_dateCacheN > 2000) { _dateCache = {}; _dateCacheN = 0; }
+    _dateCache[key] = s; _dateCacheN++;
+    return s;
   }
   function fmtDay(t) {
     try {
@@ -1029,6 +1050,15 @@
     peersEl.appendChild(a);
   }
 
+  /**
+   * 「发送给」这一行：只列目标，不再混入设置项。
+   *
+   * 改造前这里三段混在一起（目标 / 上下文条数 / 发言方式），
+   * 语义不通却挤在一行，看起来乱；而且整行每 1.5 秒重建一次，
+   * 点选择器时会被冲掉，体感上就是"卡"。
+   *
+   * 现在设置项独立到 #opts，只在启动时建一次，之后只更新选中态。
+   */
   function renderSendTo() {
     sendToEl.textContent = '';
     var t = targetList();
@@ -1043,8 +1073,50 @@
       });
       sendToEl.appendChild(g);
     });
-    sendToEl.appendChild(renderCtxPicker());
-    sendToEl.appendChild(renderModePicker());
+    // 设置项不再放这里：见 #opts（只建一次）
+  }
+
+  /**
+   * 设置项一行：上下文条数 + 发言方式。
+   *
+   * 只在启动时构建一次，之后只更新各自的选中态（syncOpts）。
+   * 改造前这两个选择器在 renderSendTo 里每 1.5 秒重建，
+   * 点了会被冲掉——这是"卡"的主要来源。
+   */
+  function buildOpts() {
+    if (state.optsBuilt) return;
+    state.optsBuilt = true;
+    optsEl.textContent = '';
+    optsEl.appendChild(renderCtxPicker());
+    optsEl.appendChild(renderModePicker());
+  }
+
+  /** 只刷新选中态，不重建 DOM */
+  function syncOpts() {
+    var kids = optsEl.querySelectorAll('.cb, .mb');
+    // 桩环境可能没有 querySelectorAll 的实现，退化到遍历
+    if (!kids || !kids.length) {
+      var arr = [];
+      (function walk(n) {
+        (n.children || []).forEach(function (c) {
+          if (c.className && (c.className.split(/\s+/).indexOf('cb') >= 0
+            || c.className.split(/\s+/).indexOf('mb') >= 0)) arr.push(c);
+          if (c.children && c.children.length) walk(c);
+        });
+      })(optsEl);
+      kids = arr;
+    }
+    Array.prototype.forEach.call(kids, function (b) {
+      var on = b.getAttribute('data-on') === '1';
+      var want = b.getAttribute('data-key');
+      if (want === 'mode') {
+        var isOn = b.getAttribute('data-val') === state.mode;
+        b.className = (b.getAttribute('data-val') === state.mode) ? 'mb on' : 'mb';
+      } else if (want === 'ctx') {
+        var isOn2 = Number(b.getAttribute('data-val')) === state.ctxLimit;
+        b.className = isOn2 ? 'cb on' : 'cb';
+      }
+    });
   }
 
   /**
@@ -1080,10 +1152,13 @@
       var on = state.mode === o[0];
       var b = el('span', 'mb' + (on ? ' on' : ''), o[1]);
       b.title = o[2];
+      // 带 data-* 供 syncOpts 定位；点击只更新状态 + 刷选中态，不重建 DOM
+      b.setAttribute('data-key', 'mode');
+      b.setAttribute('data-val', o[0]);
       b.addEventListener('click', function () {
         state.mode = o[0];
         try { localStorage.setItem(MODE_KEY, o[0]); } catch (e) {}
-        renderSendTo();
+        syncOpts();
       });
       box.appendChild(b);
     });
@@ -1114,12 +1189,14 @@
       b.title = n === 0
         ? '不带历史，只发本次内容（最省 token）'
         : ('发送时自动附带最近 ' + n + ' 条记录，让 AI 知道前因后果');
+      b.setAttribute('data-key', 'ctx');
+      b.setAttribute('data-val', String(n));
       b.addEventListener('click', function () {
         state.ctxLimit = n;
         // 独立窗口没有 ctx（那是插件实例的 API），用 localStorage 记住选择。
         // 页面来自 http://127.0.0.1:<port>，同源即可，端口变了会重置——可接受。
         try { localStorage.setItem(CTX_KEY, String(n)); } catch (e) {}
-        renderSendTo();
+        syncOpts();
       });
       box.appendChild(b);
     });
@@ -1141,6 +1218,15 @@
     // 记录被清空（或换了一轮）→ 整体重绘
     if (ms.length < prevCount) { msgsEl.textContent = ''; state.seen = {}; }
     state.lastCount = ms.length;
+
+    // 游标：记住上次扫到哪一条，下次只处理新增的。
+    // 改造前每 1.5 秒都从 0 开始遍历全部消息（记录上限 500 条），
+    // 条数多了就是白白的 CPU 开销。现在无新消息时几乎零成本。
+    if (state.scanFrom == null || ms.length < state.scanFrom) state.scanFrom = 0;
+    var scanFrom = state.scanFrom;
+    state.scanFrom = ms.length;
+    // 但"是否需要补插跨天分隔"依赖前一条，所以从 scanFrom-1 开始看
+    if (scanFrom > 0) scanFrom -= 1;
 
     var busy = (state.chat.busy || []).length;
     var streaming = Object.keys(state.streams).length > 0;
@@ -1164,13 +1250,14 @@
 
     var stick = msgsEl.scrollTop + msgsEl.clientHeight >= msgsEl.scrollHeight - 90;
 
-    for (var i = 0; i < ms.length; i++) {
+    // 跨天分隔用缓存的日期串，避免每条消息都 new Date() 两次
+    for (var i = scanFrom; i < ms.length; i++) {
       var m = ms[i];
       if (state.seen[m.id]) continue;
       state.seen[m.id] = true;
       var prev = i > 0 ? ms[i - 1] : null;
-      // 跨天插一个分隔
-      if (prev && new Date(prev.at).toDateString() !== new Date(m.at).toDateString()) {
+      // 跨天插一个分隔（用 toDateString 的缓存，见 dateStr）
+      if (prev && dateStr(prev.at) !== dateStr(m.at)) {
         msgsEl.appendChild(el('div', 'daysep', fmtDay(m.at)));
       }
       var node = buildMsg(m);
@@ -2561,6 +2648,10 @@
    */
   function tick() {
     pullStatus().then(pullChat).then(function () {
+      // 设置项只在第一次构建，之后只同步选中态——
+      // 改造前每 1.5 秒重建它们，点了会被冲掉。
+      buildOpts();
+      syncOpts();
       renderPeers(); renderSendTo(); renderMsgs(); renderStatus();
     }, function () {}).then(function () {
       setTimeout(tick, 1500);
