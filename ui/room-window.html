@@ -188,6 +188,12 @@
   .ev .bub .relay-tag{display:inline-block;margin-bottom:6px;padding:1px 7px;border-radius:999px;
     font-size:10.5px;background:var(--pri-soft);color:var(--pri)}
 
+  /* 分工表标记栏 */
+  .ev .bub .planhint{display:flex;align-items:center;gap:8px;margin-bottom:8px;
+    padding-bottom:7px;border-bottom:1px solid var(--line-2);font-size:11.5px;color:var(--pri);font-weight:600}
+  .ev .bub .planhint button{padding:2px 9px;font-size:11px;border-radius:6px;
+    background:var(--pri-soft);border-color:var(--pri);color:var(--pri);font-weight:400}
+
   /* ---------- 消息搜索 ---------- */
   #searchBar{display:none;align-items:center;gap:7px;padding:7px 14px;background:var(--chrome);
     border-bottom:1px solid var(--line);flex:none}
@@ -1040,6 +1046,21 @@
     // 接力来的消息：标一下来源
     if (!me && m.relayed) {
       bub.appendChild(el('div', 'relay-tag', '接力 · 其他成员发来的'));
+    }
+
+    // 分工表：加个醒目标记和「复制表格」按钮。
+    // 表格是 Markdown，直接选中复制会带走界面排版；
+    // 单独复制原文，才能直接粘进文档或交给别的工具。
+    if (!me && m.isPlan) {
+      var planHd = el('div', 'planhint');
+      planHd.appendChild(el('span', null, '📋 分工表'));
+      var cpBtn = el('button', null, '复制表格');
+      cpBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        copyText(m.text || '', cpBtn);
+      });
+      planHd.appendChild(cpBtn);
+      bub.appendChild(planHd);
     }
 
     // 被引用原文：显示在气泡最上方，点了能跳回那条消息

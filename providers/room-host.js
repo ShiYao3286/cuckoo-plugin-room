@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.13.1';
+const VERSION = '0.13.2';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -1165,8 +1165,13 @@ function planStart(task, opts) {
   plan.error = '';
   plan.ctrl = new AbortController();
   const sig = plan.ctrl.signal;
+  // 本次讨论的唯一标识：给每条产出打上，便于区分批次。
+  // 否则"按 planStage 过滤"会把上一轮的产出也算进来（实测踩过）。
+  const runId = 'pr' + Date.now().toString(36);
+  plan.runId = runId;
 
-  const totalCalls = members.length * 2 + 1;   // 提案 + 评议 + 1 次汇总
+  // 单成员时第 2 阶段会被跳过，实际调用数要按此计算，否则成本预告会虚高
+  const totalCalls = (members.length >= 2 ? members.length * 2 : members.length) + 1;
 
   pushMsg({
     role: 'user', who: '我', text: '【分工讨论】' + text, mode: 'plan',
@@ -1174,7 +1179,9 @@ function planStart(task, opts) {
   });
   pushMsg({
     role: 'system', who: '系统',
-    text: '开始分工讨论：' + members.length + ' 位成员 × 3 阶段 = ' + totalCalls + ' 次调用。'
+    text: '开始分工讨论：' + members.length + ' 位成员，'
+      + (members.length >= 2 ? '3 阶段' : '2 阶段（单成员跳过交叉评议）')
+      + '，共 ' + totalCalls + ' 次调用。'
       + '每阶段只做一件事，原文都会记在这里。随时可以点「停止」。',
   });
 
@@ -1198,7 +1205,7 @@ function planStart(task, opts) {
             proposals.push({ mention, windowId: w.windowId, label: w.title || w.providerId, text: res.text });
             pushMsg({
               role: 'ai', who: w.title || w.providerId, windowId: w.windowId, mention,
-              text: res.text, planStage: 1,
+              text: res.text, planStage: 1, planRun: runId,
             });
           } else {
             streamEnd(w.windowId, '', res.error);
@@ -1217,13 +1224,26 @@ function planStart(task, opts) {
       if (!proposals.length) return finishPlan('没有人给出提案', true);
 
       // ---------- 第 2 阶段：交叉评议 ----------
-      plan.stage = 2;
-      plan.stageName = '交叉评议';
-      plan.done = 0;
-      pushMsg({ role: 'system', who: '系统', text: '进入第 2 步：交叉评议（各自挑错，不是附和）' });
-
+      //
+      // 只有一位成员时跳过这一阶段：没有"别人"可评议，
+      // 它只能自己评自己。实测中 AI 自己都看出来了，如实写道：
+      //   「没有其他人的提案可供比对……交叉评议实际退化成了自评」。
+      // 跳过能省一次调用，也避免这种无意义的产出。
       const reviews = [];
-      await Promise.all(members.map(async (w) => {
+      if (members.length < 2) {
+        pushMsg({
+          role: 'system', who: '系统',
+          text: '跳过第 2 步（交叉评议）：只有 1 位成员，没有人可以评议它的提案。'
+            + '要让这一步有效，请再打开一个 AI 窗口。',
+        });
+      } else {
+        plan.stage = 2;
+        plan.stageName = '交叉评议';
+        plan.done = 0;
+        pushMsg({ role: 'system', who: '系统', text: '进入第 2 步：交叉评议（各自挑错，不是附和）' });
+      }
+
+      if (members.length >= 2) await Promise.all(members.map(async (w) => {
         if (plan.abort) return;
         const mention = (roster.find((r) => r.windowId === w.windowId) || {}).mention || ('AI-' + w.windowId);
         chat.busy[w.windowId] = true;
@@ -1238,7 +1258,7 @@ function planStart(task, opts) {
             reviews.push({ mention, windowId: w.windowId, label: w.title || w.providerId, text: res.text });
             pushMsg({
               role: 'ai', who: w.title || w.providerId, windowId: w.windowId, mention,
-              text: res.text, planStage: 2,
+              text: res.text, planStage: 2, planRun: runId,
             });
           } else {
             streamEnd(w.windowId, '', res.error);
@@ -1253,7 +1273,9 @@ function planStart(task, opts) {
       }));
 
       if (plan.abort) return finishPlan('用户停止', true);
-      if (!reviews.length) return finishPlan('没有人给出评议', true);
+      // 多成员时，一条评议都没有说明全都失败了，没有依据可合成，如实结束。
+      // 单成员时本阶段是被跳过的，reviews 本来就是空——不能因此中断。
+      if (members.length >= 2 && !reviews.length) return finishPlan('没有人给出评议', true);
 
       // ---------- 第 3 阶段：合成分工表 ----------
       plan.stage = 3;
@@ -1274,7 +1296,7 @@ function planStart(task, opts) {
           streamEnd(sw.windowId, res.text);
           pushMsg({
             role: 'ai', who: sw.title || sw.providerId, windowId: sw.windowId, mention: synthMention,
-            text: res.text, planStage: 3, isPlan: true,
+            text: res.text, planStage: 3, isPlan: true, planRun: runId,
           });
           pushMsg({
             role: 'system', who: '系统',
