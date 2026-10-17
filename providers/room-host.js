@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.13.3';
+const VERSION = '0.14.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -311,8 +311,13 @@ function buildCaptureCode(timeoutMs) {
     '      if (!d.finished) return;',
     '      var t = d.text || acc || ""; lastText = t;',
     '      if (hasToolBlock(t)) {',
-    // 工具调用轮：清空重来，并让页面上的半成品也一并清掉
+    // 工具调用轮：清空已显示正文，并让页面上的半成品也一并清掉。
+    //
+    // 但**不能直接扔掉这段文本** —— 它就是"AI 要做什么动作"的唯一来源。
+    // 之前一律丢弃，结果用户永远看不到成员打算改哪个文件、跑什么命令，
+    // 只看到最后一句话。现在把它留在动作槽里，由主进程取走展示。
     '        acc = "";',
+    '        try { window.__ckRoomAction = { t: String(t || ""), n: (window.__ckRoomAction ? window.__ckRoomAction.n : 0) + 1, at: Date.now() }; } catch (e) {}',
     '        try { window.__ckRoomStream = { t: "", n: window.__ckRoomStream.n + 1, done: false, tool: true }; } catch (e) {}',
     '        return;',
     '      }',
@@ -329,6 +334,25 @@ function buildCaptureCode(timeoutMs) {
 
 /** 只读页面上那个增量出口；不在则返回 null */
 const STREAM_PEEK = '(function(){ var s = window.__ckRoomStream; return s ? { t: s.t, n: s.n, done: s.done === true } : null; })();';
+
+/**
+ * 读「动作槽」：AI 打算做什么（工具调用轮原文）。
+ *
+ * 与 STREAM_PEEK 分开读，因为两者节奏不同——正文是连续增量，
+ * 动作是一轮一跳。合并成一个出口会让判断变复杂。
+ */
+const ACTION_PEEK = '(function(){ var a = window.__ckRoomAction; return a ? { t: a.t, n: a.n, at: a.at } : null; })();';
+
+/** 从工具调用轮原文里抽出一个简短的动作摘要，给界面显示 */
+function summarizeAction(text) {
+  const raw = String(text || '');
+  // 取第一个 ```cuckoo / ```js 代码块的起始几行；没有就取前 120 字
+  const m = raw.match(/```(?:cuckoo|js)[^\n]*\n([\s\S]*?)```/);
+  const body = m ? m[1] : raw;
+  const lines = body.split('\n').map((s) => s.trim()).filter(Boolean);
+  const pick = lines.slice(0, 4).join('\n');
+  return pick.length > 400 ? (pick.slice(0, 400) + '…') : pick;
+}
 
 /**
  * 向指定窗口发一条消息并等回复。
@@ -362,18 +386,31 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
   // 增量轮询：只在有 onProgress 时启动，且随 capture 结束自动停
   let stopPeek = false;
   let peekTimer = null;
-  if (onProgress) {
+  const onAction = opts && typeof opts.onAction === 'function' ? opts.onAction : null;
+  if (onProgress || onAction) {
     let lastN = -1;
+    let lastActN = -1;
     (async function peekLoop() {
       while (!stopPeek) {
         await new Promise((r) => { peekTimer = setTimeout(r, 250); });
         if (stopPeek) break;
         try {
-          const s = await wc.executeJavaScript(STREAM_PEEK, true);
-          if (!s || typeof s.n !== 'number') continue;
-          if (s.n === lastN) continue;
-          lastN = s.n;
-          if (typeof s.t === 'string' && s.t.length) onProgress(s.t, { done: s.done === true });
+          if (onProgress) {
+            const s = await wc.executeJavaScript(STREAM_PEEK, true);
+            if (s && typeof s.n === 'number' && s.n !== lastN) {
+              lastN = s.n;
+              if (typeof s.t === 'string' && s.t.length) onProgress(s.t, { done: s.done === true });
+            }
+          }
+          // 动作与正文分两个槽读：动作是一轮一跳，不能用增量的去重条件
+          if (onAction) {
+            const a = await wc.executeJavaScript(ACTION_PEEK, true);
+            if (a && typeof a.n === 'number' && a.n !== lastActN) {
+              lastActN = a.n;
+              const brief = summarizeAction(a.t);
+              if (brief) onAction(brief, { raw: a.t });
+            }
+          }
         } catch (_) { /* 页面可能正在导航，忽略这一轮 */ }
       }
     })().catch(() => {});
@@ -720,7 +757,25 @@ function buildChatContext(limit, excludeId, topicId) {
 }
 
 /**
- * 把"引用"整理成提示词前缀。 *
+ * 把成员的「动作」记成一条消息。
+ *
+ * 为什么值得单独记：AI 真去改文件/跑命令时，用户最想知道"它现在要干什么"。
+ * 此前这类信息被 hasToolBlock 分支整段丢掉，只剩最后一句总结，
+ * 用户只能看到结果、看不到过程。
+ *
+ * 只做展示，不拦截、不审批——这不是权限系统，别指望它防住什么。
+ */
+function pushAction(windowId, label, brief, raw) {
+  if (!brief) return null;
+  return pushMsg({
+    role: 'action', who: label, windowId: windowId,
+    text: brief, actionRaw: raw || '',
+  });
+}
+
+/**
+ * 把"引用"整理成提示词前缀。
+ *
  * 为什么需要它：@ 只能指定"发给谁"，没法指定"针对哪条"。
  * 想说"针对刚才那条"时，用户只能手动复述一遍，既啰嗦又容易失真。
  *
@@ -903,6 +958,7 @@ async function chatSend(body) {
       const prompt = head + first.prefix + text;
       const res = await sendAndCapture(wcOf(w), prompt, cfg.replyTimeoutMs, {
         onProgress: (t) => streamDelta(w.windowId, t),
+        onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
       });
       if (res.ok) {
         streamEnd(w.windowId, res.text);
@@ -968,6 +1024,7 @@ async function chatSend(body) {
             + '【来自成员 ' + msg.mention + ' 的话】\n' + msg.text;
           const res = await sendAndCapture(wcOf(tw), prompt, cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(tw.windowId, t),
+            onAction: (brief, info) => pushAction(tw.windowId, tw.title || tw.providerId, brief, info && info.raw),
           });
           if (res.ok) {
             streamEnd(tw.windowId, res.text);
@@ -1198,6 +1255,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(1, { roster, self: mention, task: text }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
+            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
             signal: sig,
           });
           if (res.ok) {
@@ -1251,6 +1309,7 @@ function planStart(task, opts) {
         try {
           const res = await sendAndCapture(wcOfWin(w), planPrompt(2, { roster, self: mention, task: text, proposals }), cfg.replyTimeoutMs, {
             onProgress: (t) => streamDelta(w.windowId, t),
+            onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw),
             signal: sig,
           });
           if (res.ok) {
@@ -1290,6 +1349,7 @@ function planStart(task, opts) {
       try {
         const res = await sendAndCapture(wcOfWin(sw), planPrompt(3, { roster, self: synthMention, task: text, proposals, reviews }), cfg.replyTimeoutMs, {
           onProgress: (t) => streamDelta(sw.windowId, t),
+          onAction: (brief, info) => pushAction(sw.windowId, sw.title || sw.providerId, brief, info && info.raw),
           signal: sig,
         });
         if (res.ok) {

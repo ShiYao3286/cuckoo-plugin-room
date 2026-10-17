@@ -194,6 +194,18 @@
   .ev .bub .planhint button{padding:2px 9px;font-size:11px;border-radius:6px;
     background:var(--pri-soft);border-color:var(--pri);color:var(--pri);font-weight:400}
 
+  /* 动作卡片：成员打算做什么（工具调用轮） */
+  .ev.act{opacity:1}
+  .ev.act .bub{background:var(--code-bg);border:1px dashed var(--line-2);border-radius:7px;
+    font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.6;
+    white-space:pre-wrap;word-break:break-word;color:var(--fg-2);max-height:180px;overflow:auto}
+  .ev.act .hd .who{color:var(--fg-3)}
+  .ev.act .hd .actmore{margin-left:auto;padding:1px 8px;font-size:10.5px;border-radius:5px;
+    background:transparent;border-color:var(--line-2);color:var(--fg-3)}
+  .ev.act .hd .actmore:hover{color:var(--fg)}
+  .ev.act .hd::after{content:'🔧 动作';font-size:10.5px;color:var(--warn);
+    border:1px solid var(--warn);border-radius:4px;padding:0 4px;margin-left:auto;opacity:.8}
+
   /* ---------- 消息搜索 ---------- */
   #searchBar{display:none;align-items:center;gap:7px;padding:7px 14px;background:var(--chrome);
     border-bottom:1px solid var(--line);flex:none}
@@ -1021,6 +1033,33 @@
       s.setAttribute('data-mid', m.id);
       s.appendChild(el('div', 'bub', m.text));
       return s;
+    }
+    // 动作：AI 打算做什么（工具调用轮）。单独一种样式，和正文区分开。
+    if (m.role === 'action') {
+      var a = el('div', 'ev act');
+      a.setAttribute('data-mid', m.id);
+      a.style.setProperty('--id-h', hueOf(m.windowId));
+      a.appendChild(el('div', 'av', initialOf(m.who)));
+      var acol = el('div', 'col');
+      var ahd = el('div', 'hd');
+      ahd.appendChild(el('span', 'who', m.who || 'AI'));
+      ahd.appendChild(el('span', 'tm', fmtTime(m.at)));
+      acol.appendChild(ahd);
+      var abub = el('div', 'bub', m.text || '');
+      acol.appendChild(abub);
+      // 原始文本比摘要长时，给个"看全文"
+      if (m.actionRaw && m.actionRaw.length > (m.text || '').length + 20) {
+        var more = el('button', 'actmore', '看全文');
+        more.addEventListener('click', function (e) {
+          e.stopPropagation();
+          var open = more.textContent === '收起';
+          abub.textContent = open ? (m.text || '') : m.actionRaw;
+          more.textContent = open ? '看全文' : '收起';
+        });
+        ahd.appendChild(more);
+      }
+      a.appendChild(acol);
+      return a;
     }
     var me = m.role === 'user';
     var d = el('div', 'ev ' + (me ? 'me' : 'ai'));
