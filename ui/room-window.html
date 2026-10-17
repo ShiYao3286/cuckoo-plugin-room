@@ -151,7 +151,28 @@
   #topicMenu .inline button{padding:4px 10px;font-size:12px;border-radius:6px}
   #topicMenu .hint{padding:6px 9px;color:var(--fg-3);font-size:10.5px;line-height:1.5}
 
-  /* 接力开关 */
+  /* 分工讨论 */
+  #planBar{display:none;flex-direction:column;gap:8px;margin-bottom:7px;padding:10px 12px;
+    background:var(--card);border:1px solid var(--line-2);border-left:3px solid var(--pri);border-radius:7px}
+  #planBar.show{display:flex}
+  #planBar .ph{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:600;color:var(--pri)}
+  #planBar .pt{font-size:11.5px;color:var(--fg-2);line-height:1.55}
+  #planBar textarea{width:100%;min-height:56px;max-height:160px;resize:vertical;
+    background:var(--card-2);color:var(--fg);border:1px solid var(--line-2);border-radius:6px;
+    padding:7px 9px;font:inherit;font-size:12.5px;outline:none}
+  #planBar textarea:focus{border-color:var(--pri)}
+  #planBar .pb{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  #planBar .pb .cost{font-size:11px;color:var(--warn);flex:1}
+  /* 进度 */
+  #planProg{display:none;align-items:center;gap:8px;padding:6px 12px;margin-bottom:7px;
+    background:var(--pri-soft);border-radius:7px;font-size:11.5px;color:var(--pri)}
+  #planProg.show{display:flex}
+  #planProg .bar{flex:1;height:4px;border-radius:2px;background:var(--line-2);overflow:hidden}
+  #planProg .bar i{display:block;height:100%;background:var(--pri);transition:width .3s}
+  #planProg .stg{font-weight:600;flex:none}
+  #planProg .stop{cursor:pointer;padding:2px 9px;border-radius:999px;
+    border:1px solid var(--pri);color:var(--pri);font-size:11px;flex:none;background:transparent}
+  #planProg .stop:hover{background:var(--pri);color:#fff}
   #relayWrap{display:flex;align-items:center;gap:5px;flex:none;font-size:11.5px;color:var(--fg-2);
     cursor:pointer;user-select:none}
   #relaySw{position:relative;width:30px;height:17px;border-radius:999px;background:var(--line-2);
@@ -447,6 +468,7 @@
       <div id="relaySw"></div><span>接力</span>
     </div>
     <div id="status">正在连接…</div>
+    <button id="btn-plan" class="icon" title="分工讨论：让成员各自提案、互相挑错，最后出一张分工表">📋</button>
     <button id="btn-refresh" class="icon" title="刷新">↻</button>
     <button id="btn-search" class="icon" title="搜索消息（Ctrl+F）">🔍</button>
     <button id="btn-clear" class="icon" title="清空当前话题">🗑</button>
@@ -490,6 +512,23 @@
   <div id="composer">
     <div id="mention"></div>
     <div id="sendTo"></div>
+    <div id="planProg">
+      <span class="stg" id="planStage">准备中</span>
+      <div class="bar"><i id="planBarFill" style="width:0%"></i></div>
+      <span id="planCount"></span>
+      <span class="stop" id="planStop">停止</span>
+    </div>
+    <div id="planBar">
+      <div class="ph">📋 分工讨论</div>
+      <div class="pt">描述你想做什么。成员会分三步：各自提案 → 交叉挑错 → 合成一张分工表。
+        <b>不会自动开工</b>，表出来由你定。</div>
+      <textarea id="planTask" placeholder="例如：给这个项目加一个导出 CSV 的功能。只描述目标，不用自己拆任务。"></textarea>
+      <div class="pb">
+        <span class="cost" id="planCost"></span>
+        <button id="planCancel">取消</button>
+        <button id="planGo" class="pri">开始</button>
+      </div>
+    </div>
     <div id="quoteBar">
       <div class="qcol">
         <div class="qw" id="quoteWho"></div>
@@ -537,6 +576,10 @@
   var searchBarEl = $('searchBar'), searchInput = $('searchInput'), searchCountEl = $('searchCnt');
   var btnSearch = $('btn-search'), searchPrev = $('searchPrev'), searchNext = $('searchNext'), searchClose = $('searchClose');
   var relayWrap = $('relayWrap'), relaySw = $('relaySw');
+  var btnPlan = $('btn-plan'), planBar = $('planBar'), planTask = $('planTask');
+  var planGo = $('planGo'), planCancel = $('planCancel'), planCost = $('planCost');
+  var planProg = $('planProg'), planStageEl = $('planStage'), planBarFill = $('planBarFill');
+  var planCount = $('planCount'), planStopBtn = $('planStop');
 
   /**
    * 危险操作确认。返回 Promise<boolean>。
@@ -1804,6 +1847,98 @@
       if (r && typeof r.relay === 'boolean' && r.relay !== state.relay) setRelay(r.relay);
     }, function () {});
   }
+
+  // ===================== 分工讨论 =====================
+  /**
+   * 三阶段：各自提案 → 交叉评议 → 合成分工表。
+   *
+   * 成本必须在开始前显示：3 位成员 = 7 次调用、好几分钟。
+   * 让人点了才知道要等多久，是最糟的体验。
+   */
+  function openPlan() {
+    planBar.className = 'show';
+    updatePlanCost();
+    try { planTask.focus(); } catch (e) {}
+  }
+  function closePlan() { planBar.className = ''; }
+
+  function updatePlanCost() {
+    var n = targetList().length;
+    if (!n) { planCost.textContent = '还没有选中成员'; return; }
+    var calls = n * 2 + 1;
+    var mins = Math.max(1, Math.round(calls * 0.5));
+    planCost.textContent = n + ' 位成员 × 3 阶段 = ' + calls + ' 次调用，约 ' + mins + ' 分钟';
+  }
+
+  btnPlan.addEventListener('click', function () {
+    if (planBar.className.indexOf('show') >= 0) closePlan(); else openPlan();
+  });
+  planCancel.addEventListener('click', closePlan);
+
+  planGo.addEventListener('click', function () {
+    var task = String(planTask.value || '').trim();
+    if (!task) { setError('请先写清要做什么'); return; }
+    var t = targetList();
+    if (!t.length) { setError('没有可用的对话对象'); return; }
+
+    if (!window.confirm) { /* 见下方 askConfirm：这里改用自家确认框 */ }
+    askConfirm('开始分工讨论',
+      '将要进行：' + t.length + ' 位成员 × 3 阶段。\n'
+      + '每个人的原文都会记在这里，你随时可以停止。\n\n'
+      + '注意：这只会生成分工表，不会自动改动任何文件。')
+      .then(function (ok) {
+        if (!ok) return;
+        setError('');
+        planGo.disabled = true;
+        api('/plan/start', { method: 'POST', body: { task: task, synth: t[0].windowId } })
+          .then(function (r) {
+            planGo.disabled = false;
+            if (!r || !r.ok) { setError((r && r.error) || '启动失败'); return; }
+            closePlan();
+            planProg.className = 'show';
+            planStageEl.textContent = '各自提案';
+            planBarFill.style.width = '0%';
+            planCount.textContent = '0 / ' + (r.totalCalls || '?');
+            startPlanPoll();
+          }, function (e) {
+            planGo.disabled = false;
+            setError('启动失败：' + ((e && e.message) || e));
+          });
+      });
+  });
+
+  var planTimer = null;
+  function startPlanPoll() {
+    if (planTimer) return;
+    planTimer = setInterval(function () {
+      api('/plan/status').then(function (s) {
+        if (!s || !s.running) {
+          stopPlanPoll();
+          planProg.className = '';
+          refresh();
+          return;
+        }
+        planStageEl.textContent = s.stageName || ('第 ' + s.stage + ' 步');
+        var pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+        planBarFill.style.width = Math.max(6, Math.min(100, pct)) + '%';
+        planCount.textContent = s.done + ' / ' + s.total;
+      }, function () {});
+    }, 900);
+  }
+  function stopPlanPoll() {
+    if (planTimer) { clearInterval(planTimer); planTimer = null; }
+  }
+
+  planStopBtn.addEventListener('click', function () {
+    planStopBtn.textContent = '停止中…';
+    api('/plan/stop', { method: 'POST' }).then(function () {
+      planStopBtn.textContent = '停止';
+      stopPlanPoll();
+      planProg.className = '';
+      setError('已发送停止请求：正在进行的调用会跑完，之后不再继续');
+      refresh();
+    }, function () { planStopBtn.textContent = '停止'; });
+  });
 
   // ===================== 状态 =====================
   function renderStatus() {

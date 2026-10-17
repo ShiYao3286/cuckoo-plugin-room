@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -1016,6 +1016,284 @@ async function chatSend(body) {
   return { ok: true, message: userMsg, sentTo: targets.map((t) => ({ windowId: t.windowId, label: t.title || t.providerId })) };
 }
 
+// ===================== 分工讨论（三阶段）=====================
+/**
+ * 用户的话：「我发布任务，说我想做什么，他们会自己拆分任务给自己，
+ * 他们之间还会讨论怎么做比较好」。
+ *
+ * 关键判断：这**不等于自由聊天**。自由聊天一定会退化成互相客套
+ * （"这个方案很好""我同意"），而且没有终止条件——只能等它自己停。
+ *
+ * 所以做成三个有明确终点、有明确产出物的阶段：
+ *
+ *   1. 各自提案（并行，**互相看不见**）
+ *      互相看不见是故意的：看见了就会开始附和，提案会趋同。
+ *      产出：每人「我承担哪 1-3 项 + 怎么拆」。
+ *
+ *   2. 交叉评议（并行，看到全部提案）
+ *      唯一任务是**挑错**，不是赞同。禁止输出"同意""很好"。
+ *      产出：每人指出的重叠/空缺/卡点 + 修改建议。
+ *      这轮是真正有价值的一轮，也是"圆桌"最缺的东西。
+ *
+ *   3. 合成分工表（只让一位做）
+ *      固定格式，可直接拿去执行。
+ *      产出：| 任务 | 负责人 | 依赖 | 完成标准 | + 争议点
+ *
+ * 硬约束：轮数固定 3（不可配置）；每轮原文都进聊天记录（不是黑盒）；
+ * **不会自动开工**——分工表出来就停，用户确认后才谈得上执行。
+ */
+const plan = {
+  running: false,
+  stage: 0,          // 0 空闲，1/2/3 进行中
+  stageName: '',
+  done: 0,           // 本阶段已完成几人
+  total: 0,
+  startedAt: 0,
+  abort: false,      // 用户点了停止
+  error: '',
+};
+
+function planOpen() {
+  return plan.running ? { running: true, stage: plan.stage, stageName: plan.stageName, done: plan.done, total: plan.total } : { running: false };
+}
+
+/** 阶段提示词。每个阶段都明确"你要产出什么"和"不要做什么"，否则会跑偏。 */
+function planPrompt(stage, opts) {
+  const { roster, self, task, proposals, reviews } = opts;
+  const head = '【多 AI 协作房间 · 分工讨论】\n'
+    + '任务：' + task + '\n'
+    + '参与者：' + roster.map((r) => r.mention + '（' + r.label + '）').join('、') + '\n'
+    + '你是 ' + self + '。\n\n';
+
+  if (stage === 1) {
+    return head
+      + '【第 1 步：各自提案】\n'
+      + '你看不到其他人会说什么，也**不需要**等别人。只写你自己的部分：\n'
+      + '1) 你打算承担哪 1-3 项具体任务（要可执行，不要"负责整体设计"这种空话）\n'
+      + '2) 每项你打算怎么做（两三句话说清思路）\n'
+      + '3) 你需要别人提供什么前提（如果确实需要）\n\n'
+      + '不要写"我同意""这个方案很好"这类话。不要重复任务描述。直接给提案。';
+  }
+  if (stage === 2) {
+    const list = proposals.map((p) => '〔' + p.mention + ' 的提案〕\n' + p.text).join('\n\n');
+    return head
+      + '【第 2 步：交叉评议】\n'
+      + '以下是所有人的提案：\n\n' + list + '\n\n'
+      + '你的任务**只有一个：挑错**。逐条回答：\n'
+      + '1) 谁的部分和谁**重叠**了？（点名 + 说明怎么合并）\n'
+      + '2) 哪个环节**没有人负责**？（这是最容易被忽略的）\n'
+      + '3) 哪里会**卡住**？（缺前置条件、顺序有问题、依赖不存在）\n'
+      + '4) 谁的估工明显不合理？\n\n'
+      + '每条都要给**具体修改建议**，不要只说"有问题"。\n'
+      + '禁止输出"同意""很好""没有问题"这类无信息量的话。如果你觉得确实没问题，'
+      + '就必须指出至少一个可以做得更好的地方。';
+  }
+  // stage 3
+  const list = proposals.map((p) => '〔' + p.mention + ' 的提案〕\n' + p.text).join('\n\n');
+  const rv = reviews.map((r) => '〔' + r.mention + ' 的评议〕\n' + r.text).join('\n\n');
+  return head
+    + '【第 3 步：合成分工表】\n'
+    + '下面是所有人的提案与评议：\n\n' + list + '\n\n' + rv + '\n\n'
+    + '请把上面的讨论**合并成一张可直接执行的分工表**，严格用这个格式：\n\n'
+    + '| 任务 | 负责人 | 依赖 | 完成标准 |\n'
+    + '| --- | --- | --- | --- |\n'
+    + '| （具体任务） | （@mention） | （无 / 或其他任务） | （怎么算做完） |\n\n'
+    + '要求：\n'
+    + '- 合并重叠项，补上没人认领的环节\n'
+    + '- 负责人只能填已存在的成员 mention\n'
+    + '- 争议点单独列一节「## 需要用户定夺」，写清分歧和你的建议\n'
+    + '- 表格之后不要再写别的客套话';
+}
+
+/**
+ * 跑一次分工讨论。
+ *
+ * @param task   任务描述
+ * @param opts   { synth } 指定谁做汇总（默认第一位）
+ * @returns { ok, started, totalCalls, est }
+ */
+function planStart(task, opts) {
+  const text = String(task || '').trim();
+  if (!text) return { ok: false, error: '请先写清要做什么' };
+  if (plan.running) return { ok: false, error: '上一轮分工还在进行中' };
+
+  const list = listWindows();
+  if (!list.ok) return { ok: false, error: list.error };
+  const members = (list.windows || []).filter((w) => !w.isSubagent && w.canInject);
+  if (members.length === 0) return { ok: false, error: '没有可用的成员（请先打开 AI 窗口）' };
+
+  const roster = rosterOf(members);
+  // 汇总人：优先指定，否则第一位
+  const synthWid = opts && opts.synth != null ? Number(opts.synth) : members[0].windowId;
+  const synthMention = (roster.find((r) => r.windowId === synthWid) || roster[0]).mention;
+
+  plan.running = true;
+  plan.stage = 1;
+  plan.stageName = '各自提案';
+  plan.done = 0;
+  plan.total = members.length;
+  plan.startedAt = Date.now();
+  plan.abort = false;
+  plan.error = '';
+
+  const totalCalls = members.length * 2 + 1;   // 提案 + 评议 + 1 次汇总
+
+  pushMsg({
+    role: 'user', who: '我', text: '【分工讨论】' + text, mode: 'plan',
+    targets: members.map((m) => ({ windowId: m.windowId, label: m.title || m.providerId })),
+  });
+  pushMsg({
+    role: 'system', who: '系统',
+    text: '开始分工讨论：' + members.length + ' 位成员 × 3 阶段 = ' + totalCalls + ' 次调用。'
+      + '每阶段只做一件事，原文都会记在这里。随时可以点「停止」。',
+  });
+
+  // 异步跑，立刻返回
+  (async () => {
+    try {
+      // ---------- 第 1 阶段：各自提案 ----------
+      const proposals = [];
+      await Promise.all(members.map(async (w) => {
+        if (plan.abort) return;
+        const mention = (roster.find((r) => r.windowId === w.windowId) || {}).mention || ('AI-' + w.windowId);
+        chat.busy[w.windowId] = true;
+        streamStart(w.windowId, w.title || w.providerId);
+        try {
+          const res = await sendAndCapture(wcOfWin(w), planPrompt(1, { roster, self: mention, task: text }), cfg.replyTimeoutMs, {
+            onProgress: (t) => streamDelta(w.windowId, t),
+          });
+          if (res.ok) {
+            streamEnd(w.windowId, res.text);
+            proposals.push({ mention, windowId: w.windowId, label: w.title || w.providerId, text: res.text });
+            pushMsg({
+              role: 'ai', who: w.title || w.providerId, windowId: w.windowId, mention,
+              text: res.text, planStage: 1,
+            });
+          } else {
+            streamEnd(w.windowId, '', res.error);
+            pushMsg({ role: 'system', who: '系统', err: true, text: mention + ' 提案失败：' + res.error });
+          }
+        } catch (e) {
+          streamEnd(w.windowId, '', (e && e.message) || String(e));
+          pushMsg({ role: 'system', who: '系统', err: true, text: mention + ' 提案异常：' + (e && e.message) });
+        } finally {
+          chat.busy[w.windowId] = false;
+          plan.done++;
+        }
+      }));
+
+      if (plan.abort) return finishPlan('用户停止', true);
+      if (!proposals.length) return finishPlan('没有人给出提案', true);
+
+      // ---------- 第 2 阶段：交叉评议 ----------
+      plan.stage = 2;
+      plan.stageName = '交叉评议';
+      plan.done = 0;
+      pushMsg({ role: 'system', who: '系统', text: '进入第 2 步：交叉评议（各自挑错，不是附和）' });
+
+      const reviews = [];
+      await Promise.all(members.map(async (w) => {
+        if (plan.abort) return;
+        const mention = (roster.find((r) => r.windowId === w.windowId) || {}).mention || ('AI-' + w.windowId);
+        chat.busy[w.windowId] = true;
+        streamStart(w.windowId, w.title || w.providerId);
+        try {
+          const res = await sendAndCapture(wcOfWin(w), planPrompt(2, { roster, self: mention, task: text, proposals }), cfg.replyTimeoutMs, {
+            onProgress: (t) => streamDelta(w.windowId, t),
+          });
+          if (res.ok) {
+            streamEnd(w.windowId, res.text);
+            reviews.push({ mention, windowId: w.windowId, label: w.title || w.providerId, text: res.text });
+            pushMsg({
+              role: 'ai', who: w.title || w.providerId, windowId: w.windowId, mention,
+              text: res.text, planStage: 2,
+            });
+          } else {
+            streamEnd(w.windowId, '', res.error);
+            pushMsg({ role: 'system', who: '系统', err: true, text: mention + ' 评议失败：' + res.error });
+          }
+        } catch (e) {
+          streamEnd(w.windowId, '', (e && e.message) || String(e));
+        } finally {
+          chat.busy[w.windowId] = false;
+          plan.done++;
+        }
+      }));
+
+      if (plan.abort) return finishPlan('用户停止', true);
+      if (!reviews.length) return finishPlan('没有人给出评议', true);
+
+      // ---------- 第 3 阶段：合成分工表 ----------
+      plan.stage = 3;
+      plan.stageName = '合成分工表';
+      plan.done = 0;
+      plan.total = 1;
+      pushMsg({ role: 'system', who: '系统', text: '进入第 3 步：由 ' + synthMention + ' 合成分工表' });
+
+      const sw = members.find((m) => (roster.find((r) => r.windowId === m.windowId) || {}).mention === synthMention) || members[0];
+      chat.busy[sw.windowId] = true;
+      streamStart(sw.windowId, sw.title || sw.providerId);
+      try {
+        const res = await sendAndCapture(wcOfWin(sw), planPrompt(3, { roster, self: synthMention, task: text, proposals, reviews }), cfg.replyTimeoutMs, {
+          onProgress: (t) => streamDelta(sw.windowId, t),
+        });
+        if (res.ok) {
+          streamEnd(sw.windowId, res.text);
+          pushMsg({
+            role: 'ai', who: sw.title || sw.providerId, windowId: sw.windowId, mention: synthMention,
+            text: res.text, planStage: 3, isPlan: true,
+          });
+          pushMsg({
+            role: 'system', who: '系统',
+            text: '分工表已生成。**没有自动开工** —— 你确认或修改后再决定怎么执行。'
+              + '（耗时 ' + Math.round((Date.now() - plan.startedAt) / 1000) + ' 秒）',
+          });
+        } else {
+          streamEnd(sw.windowId, '', res.error);
+          pushMsg({ role: 'system', who: '系统', err: true, text: '合成失败：' + res.error });
+        }
+      } finally {
+        chat.busy[sw.windowId] = false;
+        plan.done++;
+      }
+
+      finishPlan('', false);
+    } catch (e) {
+      log('分工讨论异常:', e && e.message);
+      plan.error = (e && e.message) || String(e);
+      pushMsg({ role: 'system', who: '系统', err: true, text: '分工讨论异常：' + plan.error });
+      finishPlan('', true);
+    }
+  })();
+
+  return { ok: true, started: true, totalCalls, members: roster.map((r) => ({ mention: r.mention, label: r.label })), synth: synthMention };
+}
+
+function finishPlan(reason, isErr) {
+  plan.running = false;
+  plan.stage = 0;
+  plan.stageName = '';
+  plan.done = 0;
+  plan.total = 0;
+  if (reason) {
+    pushMsg({ role: 'system', who: '系统', err: !!isErr, text: '分工讨论结束：' + reason });
+  }
+}
+
+/** 取消进行中的分工讨论 */
+function planStop() {
+  if (!plan.running) return { ok: false, error: '当前没有进行中的分工讨论' };
+  plan.abort = true;
+  log('用户停止了分工讨论');
+  return { ok: true, stopping: true };
+}
+
+/** 取窗口的 webContents（plan 内部用，避免依赖闭包） */
+function wcOfWin(w) {
+  const t = pickTarget({ windowId: w.windowId });
+  return t.ok ? t.wc : null;
+}
+
 loadChat();
 
 // ===================== SSE 事件推送 =====================
@@ -1633,6 +1911,24 @@ function handle(req, res) {
     return;
   }
 
+  // ===== 分工讨论 =====
+  if (p === '/plan/start' && req.method === 'POST') {
+    readBody(req).then((raw) => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      json(res, 200, planStart(body && body.task, { synth: body && body.synth }));
+    }).catch((e) => json(res, 500, { ok: false, error: (e && e.message) || String(e) }));
+    return;
+  }
+  if (p === '/plan/stop' && req.method === 'POST') {
+    json(res, 200, planStop());
+    return;
+  }
+  if (p === '/plan/status') {
+    json(res, 200, Object.assign({ ok: true }, planOpen()));
+    return;
+  }
+
   // ===== 接力开关 =====
   if (p === '/relay' && req.method === 'POST') {
     readBody(req).then((raw) => {
@@ -1959,6 +2255,10 @@ module.exports.__room = {
   assignMentions: assignMentions,
   parseMentions: parseMentions,
   buildRelayHeader: buildRelayHeader,
+  planPrompt: planPrompt,
+  planStart: planStart,
+  planStop: planStop,
+  planState: function () { return plan; },
   relayState: function () { return relay; },
   RELAY_MAX: RELAY_MAX,
   createTopic: createTopic,
