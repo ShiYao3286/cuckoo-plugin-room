@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.17.1';
+const VERSION = '0.18.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -713,7 +713,13 @@ async function attachFileToWindow(wc, file) {
  */
 const CHAT_FILE = path.join(USER_DIR, 'cuckoo-room-chat.json');
 const MAX_MESSAGES = 500;
-const chat = { messages: [], seq: 0, busy: {}, sending: false, topics: [], activeTopic: '', trash: null };
+const chat = {
+  messages: [], seq: 0, busy: {}, sending: false, topics: [], activeTopic: '', trash: null,
+  // 发言方式：parallel（同时开工，快但互相看不见）
+  //          sequential（一个一个来，后者能看到前者）
+  // 用户实测过：并行时两个成员会干同一件事，所以要能切到串行。
+  mode: 'parallel',
+};
 let chatSaveTimer = null;
 
 /**
@@ -878,6 +884,7 @@ function chatSnapshot() {
     seq: chat.seq,
     topics: chat.topics,
     activeTopic: chat.activeTopic,
+    mode: chat.mode || 'parallel',
   };
 }
 
@@ -1061,6 +1068,8 @@ async function chatSend(body) {
   if (!targets.length) return { ok: false, error: '没有可用的对话对象（请先打开 AI 窗口）' };
 
   const mode = body.mode === 'sequential' ? 'sequential' : 'parallel';
+  // 记住用户选过的方式，下次默认沿用
+  if (body.mode === 'sequential' || body.mode === 'parallel') chat.mode = mode;
   // 上下文条数：本次请求 > 配置默认值。0 = 不带上下文。
   // 兼容旧的 withContext:false（等价于 0），避免老调用方行为突变。
   let ctxLimit;
@@ -1237,12 +1246,23 @@ async function chatSend(body) {
   (async () => {
     try {
       if (mode === 'sequential') {
-        // 顺序发言：后面的能看到前面刚说的
+        // 顺序发言：后面的能看到前面刚说的。
+        //
+        // 为什么这很重要：并行时两条消息同时发出，谁也不知道对方会说什么，
+        // 于是两个人干同一件事（实测用户就遇到：两位都在看同一个项目、
+        // 各自 read/grep/bash，做了重复劳动）。
+        // 串行则让后一位看到前一位的结论，能接着做而不是重做一遍。
         for (const w of targets) {
           const t = pickTarget({ windowId: w.windowId });
           if (!t.ok) { pushMsg({ role: 'system', who: '系统', text: '「' + (w.title || w.providerId) + '」不可用：' + t.error, err: true }); continue; }
           chat.busy[w.windowId] = true;
           streamStart(w.windowId, w.title || w.providerId);
+          // 让用户看到"轮到谁了"——串行时等待感很强，不说清楚会以为卡住
+          pushMsg({
+            role: 'system', who: '系统',
+            text: '轮到 ' + mentionOf(w.windowId) + ' 发言'
+              + (targets.indexOf(w) > 0 ? '（它能看到前面几位的回答）' : ''),
+          });
           try {
             // 顺序模式下每轮重新取上下文（后一位要看到前一位刚说的）。
             // buildPrefix 内部会排除当前这条消息，所以不会重复。
@@ -1253,6 +1273,7 @@ async function chatSend(body) {
             const prompt = head + now.prefix + text;
             const res = await sendAndCapture(t.wc, prompt, cfg.replyTimeoutMs, {
               onProgress: (tx) => streamDelta(w.windowId, tx),
+              onAction: (brief, info) => pushAction(w.windowId, w.title || w.providerId, brief, info && info.raw, mentionOf(w.windowId)),
             });
             if (res.ok) {
               streamEnd(w.windowId, res.text);

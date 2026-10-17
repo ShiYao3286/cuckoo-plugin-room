@@ -500,6 +500,13 @@
     padding:1px 9px;color:var(--fg-2);transition:.12s}
   #sendTo .tg:hover{color:var(--err);border-color:var(--err-line)}
   #sendTo .none{color:var(--err)}
+  /* 发言方式切换：并行 / 串行 */
+  #sendTo .modepick{display:inline-flex;align-items:center;gap:3px;flex:none}
+  #sendTo .modepick .ml{color:var(--fg-3);font-size:var(--fs-xs)}
+  #sendTo .modepick .mb{cursor:pointer;padding:1px 7px;border-radius:999px;font-size:var(--fs-xs);
+    color:var(--fg-3);border:1px solid transparent;transition:.12s}
+  #sendTo .modepick .mb:hover{color:var(--fg-2);background:var(--card)}
+  #sendTo .modepick .mb.on{background:var(--pri-soft);color:var(--pri);border-color:var(--pri)}
   /* 上下文条数选择器 */
   #sendTo .ctxpick{display:inline-flex;align-items:center;gap:3px;margin-left:auto;flex:none}
   #sendTo .ctxpick .cl{color:var(--fg-3);font-size:var(--fs-xs)}
@@ -763,6 +770,8 @@
     sse: 'off',
     // 当前引用：{ id, who, text } 或 null
     quote: null,
+    // 发言方式：parallel / sequential
+    mode: 'parallel',
     // 本次发送携带的历史条数（可调，0 = 不带）
     ctxLimit: 14,
     // 话题（会话隔离）
@@ -1030,6 +1039,46 @@
       sendToEl.appendChild(g);
     });
     sendToEl.appendChild(renderCtxPicker());
+    sendToEl.appendChild(renderModePicker());
+  }
+
+  /**
+   * 发言方式选择器。
+   *
+   * 为什么必须给这个开关：并行时两条消息同时发出，谁也不知道对方会说什么，
+   * 于是两个成员会干同一件事（实测：两位都在看同一个项目，各自 read/grep/bash）。
+   * 串行让后一位看到前一位的结论，代价是总时长相加。
+   * 这种事该让用户按任务自己决定，不该替他猜。
+   */
+  var MODE_KEY = 'cuckoo.room.mode';
+
+  function loadMode() {
+    try {
+      var v = localStorage.getItem(MODE_KEY);
+      if (v === 'sequential' || v === 'parallel') return v;
+    } catch (e) {}
+    return 'parallel';
+  }
+
+  function renderModePicker() {
+    var box = el('span', 'modepick');
+    box.appendChild(el('span', 'ml', '方式'));
+    var opts = [
+      ['parallel', '同时', '所有人同时开工。快，但互相看不见对方在做什么'],
+      ['sequential', '排队', '一个一个来，后一位能看到前一位的回答（总时长相加）'],
+    ];
+    opts.forEach(function (o) {
+      var on = state.mode === o[0];
+      var b = el('span', 'mb' + (on ? ' on' : ''), o[1]);
+      b.title = o[2];
+      b.addEventListener('click', function () {
+        state.mode = o[0];
+        try { localStorage.setItem(MODE_KEY, o[0]); } catch (e) {}
+        renderSendTo();
+      });
+      box.appendChild(b);
+    });
+    return box;
   }
 
   /** 上下文条数选择器。
@@ -2272,7 +2321,7 @@
     var payload = {
       text: text,
       targets: t.map(function (w) { return w.windowId; }),
-      mode: 'parallel',
+      mode: state.mode,
       // 发到当前话题
       topic: state.activeTopic,
       // 接力开关：开启后成员回复里 @ 别人会自动转发
@@ -2459,6 +2508,7 @@
   // ===================== 轮询 =====================
   applyTheme('dark');
   state.ctxLimit = loadCtxLimit();
+  state.mode = loadMode();
   // 接力默认关；启动时问一下服务端（可能上次开着）
   setRelay(false);
   pullRelay();
