@@ -35,7 +35,7 @@ const { createRequire } = require('node:module');
 
 const requireFromHere = createRequire(__filename);
 
-const VERSION = '0.15.0';
+const VERSION = '0.16.0';
 const PLUGIN_ID = 'cuckoo-room';
 /** __dirname 是 <插件目录>/providers */
 const PLUGIN_DIR = path.resolve(__dirname, '..');
@@ -285,24 +285,31 @@ function buildCaptureCode(timeoutMs) {
   return [
     '(function () {',
     '  return new Promise(function (resolve) {',
-    '    var acc = "", lastText = "", done = false;',
+    '    var acc = "", lastText = "", done = false, thinkAcc = "";',
     '    var BT = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);',
     // 把增量文本挂到页面全局，供主进程轮询取出 —— executeJavaScript 只在最后 resolve 一次，
     // 没有这个出口就拿不到中间过程。带一个单调递增的 n，便于主进程判断有没有变化。
     '    window.__ckRoomStream = { t: "", n: 0, done: false };',
+    // 思考过程单独一个槽：可能与正文交替推送，混在一个变量里会互相覆盖
+    '    window.__ckRoomThink = { t: "", n: 0 };',
     '    function hasToolBlock(t) { t = t || ""; return t.indexOf(BT + "cuckoo") >= 0 || t.indexOf(BT + "js") >= 0; }',
     '    function finish(text, reason) {',
     '      if (done) return; done = true;',
     '      window.removeEventListener("cuckoo-ai-stream", onStream);',
     '      window.removeEventListener("cuckoo-ai-response", onResp);',
     '      try { window.__ckRoomStream = { t: String(text || ""), n: window.__ckRoomStream.n + 1, done: true, reason: reason }; } catch (e) {}',
-    '      resolve({ text: text, reason: reason });',
+    '      resolve({ text: text, reason: reason, think: thinkAcc });',
     '    }',
     '    function onStream(ev) {',
     '      var d = (ev && ev.detail) || {};',
+    // 思考过程：detail.think 一直都有（observer.ts 会透传），只是从来没读过。
+    // 单独放一个槽，和正文分开——思考可能上万字，混在一起会把正文冲掉。
+    '      if (typeof d.think === "string" && d.think.length >= thinkAcc.length) {',
+    '        thinkAcc = d.think;',
+    '        try { window.__ckRoomThink = { t: thinkAcc, n: (window.__ckRoomThink ? window.__ckRoomThink.n : 0) + 1 }; } catch (e) {}',
+    '      }',
     '      if (typeof d.text === "string" && d.text.length >= acc.length) {',
     '        acc = d.text;',
-    // thinking 阶段也可能推流：只有拿到正文才更新，避免把思考过程当正文显示
     '        try { window.__ckRoomStream = { t: acc, n: window.__ckRoomStream.n + 1, done: false }; } catch (e) {}',
     '      }',
     '    }',
@@ -342,6 +349,15 @@ const STREAM_PEEK = '(function(){ var s = window.__ckRoomStream; return s ? { t:
  * 动作是一轮一跳。合并成一个出口会让判断变复杂。
  */
 const ACTION_PEEK = '(function(){ var a = window.__ckRoomAction; return a ? { t: a.t, n: a.n, at: a.at } : null; })();';
+
+/**
+ * 读「思考槽」：AI 的推理过程。
+ *
+ * 数据一直都有（`cuckoo-ai-stream` 的 detail.think），只是从没读过。
+ * 注意不是所有平台都会给：DeepSeek 要开「深度思考」，ChatGPT 只有 o 系列，
+ * Claude 要显式开 extended thinking。拿不到就是空，界面上要能优雅处理。
+ */
+const THINK_PEEK = '(function(){ var k = window.__ckRoomThink; return k ? { t: k.t, n: k.n } : null; })();';
 
 /**
  * 从动作原文里解析出「涉及的文件」，并区分读/写。
@@ -511,9 +527,11 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
   let stopPeek = false;
   let peekTimer = null;
   const onAction = opts && typeof opts.onAction === 'function' ? opts.onAction : null;
-  if (onProgress || onAction) {
+  const onThink = opts && typeof opts.onThink === 'function' ? opts.onThink : null;
+  if (onProgress || onAction || onThink) {
     let lastN = -1;
     let lastActN = -1;
+    let lastThinkN = -1;
     (async function peekLoop() {
       // 先立刻读一次再进定时循环。
       //
@@ -537,6 +555,14 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
               lastActN = a.n;
               const brief = summarizeAction(a.t);
               if (brief) onAction(brief, { raw: a.t });
+            }
+          }
+          // 思考过程：增量推送，界面折叠显示；不进上下文
+          if (onThink) {
+            const k = await wc.executeJavaScript(THINK_PEEK, true);
+            if (k && typeof k.n === 'number' && k.n !== lastThinkN) {
+              lastThinkN = k.n;
+              if (typeof k.t === 'string' && k.t.length) onThink(k.t);
             }
           }
         } catch (_) { /* 页面可能正在导航，忽略这一轮 */ }
@@ -573,7 +599,6 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
   }
   const res = await Promise.race(racers);
   stopPeekLoop();
-
   const reason = res && res.reason;
   if (reason === 'aborted') {
     return { ok: false, aborted: true, error: '已取消', partial: (res && res.text) || '' };
@@ -582,7 +607,7 @@ async function sendAndCapture(wc, text, timeoutMs, opts) {
     return { ok: false, error: '等待回复超时', partial: (res && res.text) || '' };
   }
   if (reason && String(reason).indexOf('capture_error') === 0) return { ok: false, error: reason };
-  return { ok: true, text: (res && res.text) || '' };
+  return { ok: true, text: (res && res.text) || '', think: (res && res.think) || '' };
 }
 
 // ===================== 附件上传 =====================
@@ -1122,6 +1147,8 @@ async function chatSend(body) {
           role: 'ai', who: w.title || w.providerId || ('窗口 ' + w.windowId),
           windowId: w.windowId, mention: mentionOf(w.windowId),
           text: res.text, replyTo: userMsg.id,
+          // 思考过程只给人看，不进上下文（buildChatContext 不读这个字段）
+          think: res.think || '',
         });
         // 回复里 @ 了别人 → 触发接力（受 RELAY_MAX 限制）
         maybeRelay(msg);
@@ -1188,6 +1215,7 @@ async function chatSend(body) {
             const m2 = pushMsg({
               role: 'ai', who: tw.title || tw.providerId, windowId: tw.windowId,
               mention: h.mention, text: res.text, relayed: true,
+              think: res.think || '',
             });
             maybeRelay(m2);          // 允许继续接力
           } else {
@@ -1231,6 +1259,7 @@ async function chatSend(body) {
               const m = pushMsg({
                 role: 'ai', who: w.title || w.providerId, windowId: w.windowId,
                 mention: mentionOf(w.windowId), text: res.text, replyTo: userMsg.id,
+                think: res.think || '',
               });
               maybeRelay(m);
             } else {
